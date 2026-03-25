@@ -21,7 +21,7 @@ from telegram.constants import ParseMode
 
 from engine import (
     PlatiniumEngine, fetch_price, fetch_klines, get_astro,
-    get_readings, PATTERNS, calc_edge, LivePrice
+    get_readings, PATTERNS, calc_edge, LivePrice, PolymarketState
 )
 
 # ── CONFIG ──────────────────────────────────────────────────────
@@ -36,9 +36,10 @@ EDGE_ALERT_LEVELS = [50, 70, 85]                             # alert when edge c
 EQUITY_ALERT_PCT  = float(os.getenv("EQUITY_ALERT_PCT", "5"))# alert every X% balance change
 
 # Intervals (seconds)
-TICK_INTERVAL     = int(os.getenv("TICK_INTERVAL", "30"))    # engine tick every 30s
-PRICE_INTERVAL    = int(os.getenv("PRICE_INTERVAL", "15"))   # price fetch every 15s
-DAILY_HOUR        = int(os.getenv("DAILY_HOUR", "8"))        # daily summary at 08:00 UTC
+TICK_INTERVAL        = int(os.getenv("TICK_INTERVAL", "30"))       # engine tick every 30s
+PRICE_INTERVAL       = int(os.getenv("PRICE_INTERVAL", "15"))      # price fetch every 15s
+POLYMARKET_INTERVAL  = int(os.getenv("POLYMARKET_INTERVAL", "300"))# polymarket fetch every 5m
+DAILY_HOUR           = int(os.getenv("DAILY_HOUR", "8"))           # daily summary at 08:00 UTC
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -165,6 +166,34 @@ def fmt_astro(a) -> str:
     ])
 
 
+def fmt_polymarket(pm: PolymarketState) -> str:
+    if pm.bull_pct > 60:
+        crowd = "🟢 BULLISH"
+    elif pm.bull_pct < 40:
+        crowd = "🔴 BEARISH"
+    else:
+        crowd = "🟡 NEUTRAL"
+    bar_filled = round(pm.bull_pct / 10)
+    bar = "█" * bar_filled + "░" * (10 - bar_filled)
+    lines = [
+        "📊 *Polymarket — Crypto Crowd Sentiment*",
+        "",
+        f"`{bar}` {pm.bull_pct}% Bull",
+        f"*Crowd: {escape(crowd)}*",
+        "",
+        "*Active Markets:*",
+    ]
+    for m in pm.markets:
+        e = "🟢" if m["yes_pct"] > 55 else "🔴" if m["yes_pct"] < 45 else "🟡"
+        q = escape(m["question"][:55])
+        lines.append(f"{e} {q} — *{m['yes_pct']}%*")
+    if not pm.markets:
+        lines.append("_No data yet — fetching every 5 min_")
+    if not pm.fresh:
+        lines += ["", "⚠️ _Not yet fetched — check back soon_"]
+    return "\n".join(lines)
+
+
 def fmt_daily(summary: dict) -> str:
     s = summary
     a = s["astro"]
@@ -206,6 +235,7 @@ def main_keyboard():
          InlineKeyboardButton("🌌 Astro",  callback_data="astro")],
         [InlineKeyboardButton("🔍 Search Coin", callback_data="search_prompt"),
          InlineKeyboardButton("📋 Summary",     callback_data="summary")],
+        [InlineKeyboardButton("📊 Polymarket",  callback_data="polymarket")],
     ])
 
 
@@ -342,6 +372,13 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN_V2)
 
 
+async def cmd_polymarket(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pm = engine.get_polymarket()
+    await update.message.reply_text(
+        fmt_polymarket(pm), parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=main_keyboard())
+
+
 # ── CALLBACK QUERY HANDLER ───────────────────────────────────────
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -379,6 +416,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "search_prompt":
         await reply("🔍 *Quick coin scan — tap one:*",
                     parse_mode=ParseMode.MARKDOWN_V2, reply_markup=coin_keyboard())
+
+    elif data == "polymarket":
+        await reply(fmt_polymarket(engine.get_polymarket()),
+                    parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
 
     elif data == "back":
         await reply("🔱 *PLATINIUM*\n\nWhat do you need?",
@@ -504,6 +545,7 @@ async def engine_loop(app: Application):
     log.info("Engine loop started")
 
     price_tick = 0
+    polymarket_tick = 0
 
     while True:
         try:
@@ -512,6 +554,13 @@ async def engine_loop(app: Application):
             if price_tick >= PRICE_INTERVAL:
                 await engine.update_price(session)
                 price_tick = 0
+
+            # Fetch Polymarket sentiment every POLYMARKET_INTERVAL seconds
+            polymarket_tick += TICK_INTERVAL
+            if polymarket_tick >= POLYMARKET_INTERVAL:
+                await engine.update_polymarket(session)
+                log.info(f"Polymarket updated: {engine.polymarket.bull_pct}% bull, {len(engine.polymarket.markets)} markets")
+                polymarket_tick = 0
 
             # Tick the engine
             trade = engine.tick()
@@ -644,8 +693,9 @@ def main():
     app.add_handler(CommandHandler("astro",   cmd_astro))
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("search",  cmd_search))
-    app.add_handler(CommandHandler("stop",    cmd_stop))
-    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("stop",       cmd_stop))
+    app.add_handler(CommandHandler("status",     cmd_status))
+    app.add_handler(CommandHandler("polymarket", cmd_polymarket))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))
