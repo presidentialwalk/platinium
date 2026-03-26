@@ -132,39 +132,115 @@ class LivePrice:
     last_fetch: float = 0.0
 
 
-async def fetch_price(symbol: str = "BTCUSDT", session: Optional[aiohttp.ClientSession] = None) -> dict:
-    """Fetch 24hr ticker from Binance."""
-    url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
+# CoinGecko coin ID map — fallback when Binance is blocked
+COINGECKO_IDS: dict = {
+    "BTCUSDT":  "bitcoin",       "ETHUSDT":  "ethereum",
+    "SOLUSDT":  "solana",        "BNBUSDT":  "binancecoin",
+    "XRPUSDT":  "ripple",        "AVAXUSDT": "avalanche-2",
+    "DOGEUSDT": "dogecoin",      "LINKUSDT": "chainlink",
+    "ADAUSDT":  "cardano",       "DOTUSDT":  "polkadot",
+    "MATICUSDT":"matic-network", "LTCUSDT":  "litecoin",
+    "UNIUSDT":  "uniswap",       "ATOMUSDT": "cosmos",
+    "NEARUSDT": "near",
+}
+
+
+async def _fetch_price_coingecko(symbol: str, session: aiohttp.ClientSession) -> dict:
+    """CoinGecko fallback — returns Binance-shaped ticker dict."""
+    coin_id = COINGECKO_IDS.get(symbol.upper())
+    if not coin_id:
+        return {}
+    url = (
+        f"https://api.coingecko.com/api/v3/simple/price"
+        f"?ids={coin_id}&vs_currencies=usd"
+        f"&include_24hr_change=true&include_24hr_vol=true"
+        f"&include_high_24hr=true&include_low_24hr=true"
+    )
     try:
-        close_session = False
-        if session is None:
-            session = aiohttp.ClientSession()
-            close_session = True
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
             data = await r.json()
-        if close_session:
-            await session.close()
-        return data
+        c = data.get(coin_id, {})
+        price = float(c.get("usd", 0))
+        if not price:
+            return {}
+        return {
+            "lastPrice":          str(price),
+            "priceChangePercent": str(round(float(c.get("usd_24h_change", 0)), 2)),
+            "highPrice":          str(c.get("usd_24h_high", price * 1.02)),
+            "lowPrice":           str(c.get("usd_24h_low",  price * 0.98)),
+            "volume":             str(float(c.get("usd_24h_vol", 0)) / price),
+        }
     except Exception:
         return {}
 
 
-async def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 80,
-                       session: Optional[aiohttp.ClientSession] = None) -> list:
-    """Fetch klines (OHLCV) from Binance."""
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+async def _fetch_klines_coingecko(symbol: str, limit: int,
+                                   session: aiohttp.ClientSession) -> list:
+    """CoinGecko fallback — returns list of hourly close prices."""
+    coin_id = COINGECKO_IDS.get(symbol.upper())
+    if not coin_id:
+        return []
+    days = max(1, limit // 24 + 1)
+    url = (
+        f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+        f"?vs_currency=usd&days={days}&interval=hourly"
+    )
     try:
-        close_session = False
-        if session is None:
-            session = aiohttp.ClientSession()
-            close_session = True
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
             data = await r.json()
-        if close_session:
-            await session.close()
-        return [float(k[4]) for k in data]  # close prices
+        prices = data.get("prices", [])
+        closes = [float(p[1]) for p in prices]
+        return closes[-limit:] if len(closes) > limit else closes
     except Exception:
         return []
+
+
+async def fetch_price(symbol: str = "BTCUSDT",
+                      session: Optional[aiohttp.ClientSession] = None) -> dict:
+    """Fetch 24hr ticker — Binance first, CoinGecko fallback."""
+    owned = session is None
+    if owned:
+        session = aiohttp.ClientSession()
+    try:
+        # Try Binance
+        url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                data = await r.json()
+            if isinstance(data, dict) and "lastPrice" in data:
+                return data
+        except Exception:
+            pass
+        # Fallback: CoinGecko
+        return await _fetch_price_coingecko(symbol, session)
+    finally:
+        if owned:
+            await session.close()
+
+
+async def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1h",
+                       limit: int = 80,
+                       session: Optional[aiohttp.ClientSession] = None) -> list:
+    """Fetch close prices — Binance first, CoinGecko fallback."""
+    owned = session is None
+    if owned:
+        session = aiohttp.ClientSession()
+    try:
+        # Try Binance
+        url = (f"https://api.binance.com/api/v3/klines"
+               f"?symbol={symbol}&interval={interval}&limit={limit}")
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                data = await r.json()
+            if isinstance(data, list) and data:
+                return [float(k[4]) for k in data]
+        except Exception:
+            pass
+        # Fallback: CoinGecko
+        return await _fetch_klines_coingecko(symbol, limit, session)
+    finally:
+        if owned:
+            await session.close()
 
 
 # ═══════════════════════════════════════════════
