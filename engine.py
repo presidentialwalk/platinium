@@ -13,9 +13,15 @@ import aiohttp
 import hmac
 import hashlib
 import base64
+import os
+import logging
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
+
+log = logging.getLogger(__name__)
+
+DATA_FILE = os.getenv("DATA_FILE", "platinium_data.json")
 
 
 # ═══════════════════════════════════════════════
@@ -516,6 +522,27 @@ class Database:
             "avg_acc": round(sum(r.acc for r in with_data) / len(with_data), 1),
         }
 
+    def to_dict(self) -> dict:
+        return {
+            pid: {
+                "occ": rec.occ, "wins": rec.wins, "losses": rec.losses,
+                "acc": rec.acc, "ev": rec.ev,
+                "recent_returns": rec.recent_returns,
+            }
+            for pid, rec in self.records.items()
+        }
+
+    def load_dict(self, data: dict):
+        for pid, d in data.items():
+            if pid in self.records:
+                rec = self.records[pid]
+                rec.occ            = d.get("occ", 0)
+                rec.wins           = d.get("wins", 0)
+                rec.losses         = d.get("losses", 0)
+                rec.acc            = d.get("acc", 0.0)
+                rec.ev             = d.get("ev", 0.0)
+                rec.recent_returns = d.get("recent_returns", [])
+
 
 # ═══════════════════════════════════════════════
 # EDGE SCORE
@@ -598,6 +625,30 @@ class SimState:
     @property
     def pnl_pct(self) -> float:
         return round((self.balance - self.start_balance) / self.start_balance * 100, 1)
+
+    def to_dict(self) -> dict:
+        return {
+            "balance": self.balance,
+            "peak": self.peak,
+            "wins": self.wins,
+            "losses": self.losses,
+            "total": self.total,
+            "cons_win": self.cons_win,
+            "cons_loss": self.cons_loss,
+            "curve": self.curve[-200:],   # keep last 200 points
+            "trades": self.trades[-100:], # keep last 100 trades
+        }
+
+    def load_dict(self, data: dict):
+        self.balance   = data.get("balance", self.start_balance)
+        self.peak      = data.get("peak", self.balance)
+        self.wins      = data.get("wins", 0)
+        self.losses    = data.get("losses", 0)
+        self.total     = data.get("total", 0)
+        self.cons_win  = data.get("cons_win", 0)
+        self.cons_loss = data.get("cons_loss", 0)
+        self.curve     = data.get("curve", [self.balance])
+        self.trades    = data.get("trades", [])
 
 
 def get_lev(acc: float) -> int:
@@ -868,6 +919,32 @@ class PlatiniumEngine:
         self.executor = executor or BitgetExecutor()
         self.live_trade = LiveTradeState()
         self.trade_size_usdt = trade_size_usdt
+        self._load()
+
+    def _save(self):
+        try:
+            payload = {
+                "sim": self.sim.to_dict(),
+                "db":  self.db.to_dict(),
+            }
+            tmp = DATA_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, DATA_FILE)   # atomic write — no corrupt file on crash
+        except Exception as e:
+            log.warning(f"State save failed: {e}")
+
+    def _load(self):
+        if not os.path.exists(DATA_FILE):
+            return
+        try:
+            with open(DATA_FILE) as f:
+                payload = json.load(f)
+            self.sim.load_dict(payload.get("sim", {}))
+            self.db.load_dict(payload.get("db", {}))
+            log.info(f"State loaded from {DATA_FILE} — balance={self.sim.balance:.2f} trades={self.sim.total}")
+        except Exception as e:
+            log.warning(f"State load failed (starting fresh): {e}")
 
     def get_live_trade(self) -> LiveTradeState:
         return self.live_trade
@@ -957,6 +1034,7 @@ class PlatiniumEngine:
             "demo_balance": round(self.sim.balance, 2),
         }
         self.live_trade = LiveTradeState()  # reset
+        self._save()
         return event
 
     async def get_live_balance(self, session: aiohttp.ClientSession) -> float:
@@ -988,6 +1066,7 @@ class PlatiniumEngine:
         trade = None
         if rec and self.sim.balance > MIN_BALANCE:
             trade = execute_trade(self.sim, self.db, rec, r, a, self.trade_size_usdt)
+            self._save()
 
         return trade
 
