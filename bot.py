@@ -82,6 +82,7 @@ session: Optional[aiohttp.ClientSession] = None
 
 mas_brain = MASBrain(engine)
 dashboard  = Dashboard(engine, mas_brain)
+engine_paused: bool = False
 
 
 # ── EMOJI / FORMAT HELPERS ───────────────────────────────────────
@@ -280,18 +281,78 @@ def fmt_daily(summary: dict) -> str:
     ])
 
 
+def fmt_conditions() -> str:
+    from engine import _onchain, get_readings
+    lp   = engine.live_price
+    a    = engine.get_astro()
+    r    = get_readings(engine.price_history.closes, lp)
+    edge = engine.get_edge()
+
+    rsi_bar  = "█" * round(r.rsi / 10) + "░" * (10 - round(r.rsi / 10))
+    rsi_zone = "🔴 OB" if r.rsi > 70 else ("🟢 OS" if r.rsi < 30 else "⚪")
+    fund_e   = "🟢" if r.funding < -0.02 else ("🔴" if r.funding > 0.05 else "🟡")
+    flow_e   = "🟢" if r.chain_flow > 0.2 else ("🔴" if r.chain_flow < -0.2 else "🟡")
+    src      = "live" if (_onchain.fresh and __import__('time').time() - _onchain.updated_at < 600) else "fallback"
+
+    lines = [
+        f"{'▶️' if not engine_paused else '⏸'} *LIVE CONDITIONS* — {'RUNNING' if not engine_paused else 'PAUSED'}",
+        "",
+        f"₿ *BTC* {escape(fmt_num(lp.btc))}  {escape(('+' if lp.chg >= 0 else '')+str(round(lp.chg,2))+'%')}",
+        "",
+        "📊 *Technicals*",
+        f"  RSI: `{r.rsi}` `{rsi_bar}` {rsi_zone}",
+        f"  BB pos: `{round(r.bb*100)}%`",
+        f"  MACD: `{'+' if r.macd >= 0 else ''}{r.macd:.4f}`",
+        f"  Vol: `{r.vol_r:.2f}×`",
+        "",
+        f"🔗 *On\\-Chain* \\[_{escape(src)}_\\]",
+        f"  Funding: `{r.funding:+.4f}%` {fund_e}",
+        f"  Flow: `{r.chain_flow:+.3f}` {flow_e}",
+        f"  Whales: {'✅ accumulating' if r.whale_buy else '⚪ neutral'}",
+        "",
+        f"🌌 *Astro*",
+        f"  {a.moon_emoji} {escape(a.moon_phase)}",
+        f"  ☿ {'⚠️ RETROGRADE' if a.merc_rx else '✅ DIRECT'}",
+        f"  {'🔥 Fire sign' if a.fire_sign else ''}{'⚡ Equinox' if a.equinox else ''}",
+        "",
+        f"🔬 *Edge:* {edge.score}/100 — {escape(edge.status)}",
+        f"📦 *Patterns firing:* {'YES ✅' if engine.db.find_best(r, a) else 'none ⚪'}",
+    ]
+    return "\n".join(l for l in lines)
+
+
+def fmt_thinking() -> str:
+    disc = list(mas_brain.discoveries)[:10]
+    if not disc:
+        return "🧠 *MAS Brain* — warming up\\.\\.\\.\n\nFirst signals fire within 2 minutes of startup\\."
+
+    bias_e = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "⚪", "PATTERN": "🔵"}
+    lines  = [f"🧠 *MAS Brain* — last {len(disc)} signals", ""]
+    for d in disc:
+        e    = bias_e.get(d.bias, "⚪")
+        conf = escape(f"{d.confidence}%")
+        age  = escape(d.age_str())
+        lines.append(f"{e} *{escape(d.title)}*")
+        lines.append(f"  _{escape(d.agent)}_ · {conf} · {age}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 # ── KEYBOARD HELPERS ─────────────────────────────────────────────
 
 def main_keyboard():
+    pause_label = "▶️ Resume" if engine_paused else "⏸ Pause"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📡 Signal",  callback_data="signal"),
-         InlineKeyboardButton("⚡ Trades",  callback_data="trades")],
-        [InlineKeyboardButton("💰 Wallet",  callback_data="equity"),
-         InlineKeyboardButton("🔬 Edge",    callback_data="edge")],
-        [InlineKeyboardButton("🔍 Search",  callback_data="search_prompt"),
-         InlineKeyboardButton("🌌 Astro",   callback_data="astro")],
-        [InlineKeyboardButton("📋 Summary", callback_data="summary"),
-         InlineKeyboardButton("⚙️ Status",  callback_data="status")],
+        [InlineKeyboardButton("📡 Signal",      callback_data="signal"),
+         InlineKeyboardButton("⚡ Trades",      callback_data="trades")],
+        [InlineKeyboardButton("💰 Wallet",      callback_data="equity"),
+         InlineKeyboardButton("🔬 Edge",        callback_data="edge")],
+        [InlineKeyboardButton("🔍 Search",      callback_data="search_prompt"),
+         InlineKeyboardButton("🌌 Astro",       callback_data="astro")],
+        [InlineKeyboardButton("📊 Conditions",  callback_data="conditions"),
+         InlineKeyboardButton("🧠 Thinking",    callback_data="thinking")],
+        [InlineKeyboardButton(pause_label,      callback_data="toggle_engine"),
+         InlineKeyboardButton("⚙️ Status",      callback_data="status")],
     ])
 
 
@@ -438,6 +499,44 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN_V2)
 
 
+async def cmd_conditions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        fmt_conditions(), parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=main_keyboard())
+
+
+async def cmd_thinking(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        fmt_thinking(), parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=main_keyboard())
+
+
+async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global engine_paused
+    user_id = update.effective_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    engine_paused = True
+    log.info(f"Engine PAUSED by user {user_id}")
+    await update.message.reply_text(
+        "⏸ *Engine paused*\n\nNo new trades or signals\\. Price monitoring and trade closes still active\\.\nUse /resume to restart\\.",
+        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
+
+
+async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global engine_paused
+    user_id = update.effective_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    engine_paused = False
+    log.info(f"Engine RESUMED by user {user_id}")
+    await update.message.reply_text(
+        "▶️ *Engine resumed*\n\nBack to scanning\\. Signals and trades active\\.",
+        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
+
+
 async def cmd_settrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global TRADE_CAPITAL_USDT
     user_id = update.effective_user.id
@@ -572,6 +671,23 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"💸 Mode: *{'PAPER' if PAPER_MODE else 'LIVE'}*",
             f"🔑 Bitget: *{'✅' if _executor.enabled else '⚠️ keys not set'}*",
         ]))
+
+    elif data == "conditions":
+        await edit(fmt_conditions())
+
+    elif data == "thinking":
+        await edit(fmt_thinking())
+
+    elif data == "toggle_engine":
+        global engine_paused
+        engine_paused = not engine_paused
+        state = "paused ⏸" if engine_paused else "running ▶️"
+        log.info(f"Engine toggled → {state}")
+        await edit(
+            f"{'⏸' if engine_paused else '▶️'} *Engine {escape(state)}*\n\n"
+            + ("No new trades or signals\\. Monitoring still active\\." if engine_paused
+               else "Scanning resumed\\. Signals and trades active\\."),
+        )
 
     elif data == "back":
         await edit("🔱 *PLATINIUM* — What do you need?")
@@ -711,11 +827,15 @@ async def engine_loop(app: Application):
                 await engine.refresh_onchain(session)
                 onchain_tick = 0
 
-            # ── CHECK OPEN TRADE ──────────────────────
+            # ── CHECK OPEN TRADE (always — even when paused) ──────────
             close_ev = await engine.check_and_close_live_trade(session)
             if close_ev:
                 log.info(f"Trade closed: {close_ev['direction']} {close_ev['pattern']} pnl={close_ev['pnl_pct']}%")
                 await broadcast(app, fmt_trade_close(close_ev))
+
+            if engine_paused:
+                await asyncio.sleep(TICK_INTERVAL)
+                continue
 
             # Tick the engine
             trade = engine.tick()
@@ -860,10 +980,14 @@ def main():
     app.add_handler(CommandHandler("astro",   cmd_astro))
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("search",  cmd_search))
-    app.add_handler(CommandHandler("stop",     cmd_stop))
-    app.add_handler(CommandHandler("status",   cmd_status))
-    app.add_handler(CommandHandler("trades",   cmd_trades))
-    app.add_handler(CommandHandler("settrade", cmd_settrade))
+    app.add_handler(CommandHandler("stop",       cmd_stop))
+    app.add_handler(CommandHandler("status",     cmd_status))
+    app.add_handler(CommandHandler("trades",     cmd_trades))
+    app.add_handler(CommandHandler("settrade",   cmd_settrade))
+    app.add_handler(CommandHandler("conditions", cmd_conditions))
+    app.add_handler(CommandHandler("thinking",   cmd_thinking))
+    app.add_handler(CommandHandler("pause",      cmd_pause))
+    app.add_handler(CommandHandler("resume",     cmd_resume))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))
