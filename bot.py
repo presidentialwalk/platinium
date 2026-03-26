@@ -24,6 +24,8 @@ from engine import (
     get_readings, PATTERNS, calc_edge, LivePrice,
     BitgetExecutor, LiveTradeState
 )
+from mas import MASBrain
+from dashboard import Dashboard
 
 # ── CONFIG ──────────────────────────────────────────────────────
 TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TOKEN_HERE")
@@ -49,6 +51,9 @@ TICK_INTERVAL  = int(os.getenv("TICK_INTERVAL", "30"))   # engine tick every 30s
 PRICE_INTERVAL = int(os.getenv("PRICE_INTERVAL", "15"))  # price fetch every 15s
 DAILY_HOUR     = int(os.getenv("DAILY_HOUR", "8"))        # daily summary at 08:00 UTC
 
+# Dashboard
+DASHBOARD_PORT = int(os.getenv("PORT", os.getenv("DASHBOARD_PORT", "8080")))
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO
@@ -73,6 +78,9 @@ last_equity_alert: float = 100.0
 last_astro_flags: dict = {"merc_rx": False, "equinox": False, "moon_idx": -1}
 subscribed_chats: set = set()
 session: Optional[aiohttp.ClientSession] = None
+
+mas_brain = MASBrain(engine)
+dashboard  = Dashboard(engine, mas_brain)
 
 
 # ── EMOJI / FORMAT HELPERS ───────────────────────────────────────
@@ -799,6 +807,10 @@ async def post_init(app: Application):
     # Start background tasks
     asyncio.create_task(engine_loop(app))
     asyncio.create_task(daily_summary_loop(app))
+    # Start MAS brain + dashboard
+    _mas_session = aiohttp.ClientSession()
+    asyncio.create_task(mas_brain.run_loop(_mas_session))
+    await dashboard.start(DASHBOARD_PORT)
     # Send startup message to configured chat
     if CHAT_ID:
         try:
