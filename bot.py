@@ -110,13 +110,14 @@ def fmt_signal(sig: dict, lp_btc: float) -> str:
     d  = sig["direction"]
     de = dir_emoji(d)
     ev_sign = "+" if sig['ev'] > 0 else ""
+    ev_str  = escape(ev_sign + str(sig['ev']) + "%")
     lines = [
         f"{de} *{escape(d)} — {escape(sig['pattern'])}*",
         f"",
         f"📊 *Category:* {escape(sig['category'])}",
         f"🎯 *Accuracy:* {sig['accuracy']}%",
         f"⚡ *Confidence:* {sig['confidence']}/100",
-        f"📈 *Avg EV:* {escape(f'{ev_sign}{sig[\"ev\"]}%')}",
+        f"📈 *Avg EV:* {ev_str}",
         f"👁 *Seen:* {sig['observations']} times",
         f"",
         f"💰 *Entry:* {escape(fmt_num(sig['entry']))}",
