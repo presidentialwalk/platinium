@@ -75,6 +75,7 @@ engine = PlatiniumEngine(
 last_signal_id: Optional[str] = None
 last_edge_level: int = 0
 last_equity_alert: float = 100.0
+last_equity_alert_time: float = 0.0
 last_astro_flags: dict = {"merc_rx": False, "equinox": False, "moon_idx": -1}
 subscribed_chats: set = set()
 session: Optional[aiohttp.ClientSession] = None
@@ -741,8 +742,11 @@ async def engine_loop(app: Application):
             # ── EQUITY ALERT ──────────────────────────
             bal = engine.sim.balance
             pct_change = abs(bal - last_equity_alert) / last_equity_alert * 100
-            if pct_change >= EQUITY_ALERT_PCT and engine.sim.total > 0:
+            now_t = time.time()
+            if (pct_change >= EQUITY_ALERT_PCT and engine.sim.total > 0
+                    and now_t - last_equity_alert_time >= 3600):  # max 1 alert/hour
                 last_equity_alert = bal
+                last_equity_alert_time = now_t
                 summary = engine.get_summary()
                 log.info(f"Equity update: ${bal:.2f}")
                 await broadcast(app, fmt_equity(summary))

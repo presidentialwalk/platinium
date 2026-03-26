@@ -63,6 +63,27 @@ header{
   border-bottom:1px solid var(--border);display:flex;align-items:center;gap:6px;
 }
 
+/* ── MOBILE ── */
+@media(max-width:800px){
+  header{padding:8px 12px;gap:8px}
+  .logo{font-size:13px;letter-spacing:2px}
+  .pill{padding:2px 7px;font-size:10px}
+  /* hide less critical pills on phone */
+  .pill-hide{display:none}
+  .conn{margin-left:auto}
+  .grid{
+    display:flex;flex-direction:column;
+    min-height:unset;background:var(--bg);gap:0;
+  }
+  .panel{
+    max-height:none;overflow-y:visible;
+    border-bottom:1px solid var(--border);
+  }
+  /* feed capped at 60vh so you can scroll past it */
+  .panel.feed-panel{max-height:60vh;overflow-y:auto}
+  .bottom{border-top:1px solid var(--border)}
+}
+
 /* ── LEFT: STATS ── */
 .big{font-size:26px;font-weight:700;line-height:1;margin-bottom:4px}
 .bar-wrap{background:var(--bg3);border-radius:3px;height:6px;margin:6px 0;overflow:hidden}
@@ -135,8 +156,8 @@ svg#spark{width:100%;height:36px;display:block;margin:8px 0}
   <div class="pill"><span class="lbl">Balance</span><span class="val g" id="h-bal">$—</span></div>
   <div class="pill"><span class="lbl">P&L</span><span class="val" id="h-pnl">—</span></div>
   <div class="pill"><span class="lbl">Edge</span><span class="val p" id="h-edge">—</span></div>
-  <div class="pill"><span class="lbl">BTC</span><span class="val" id="h-btc">—</span></div>
-  <div class="pill"><span class="lbl">WR</span><span class="val g" id="h-wr">—</span></div>
+  <div class="pill pill-hide"><span class="lbl">BTC</span><span class="val" id="h-btc">—</span></div>
+  <div class="pill pill-hide"><span class="lbl">WR</span><span class="val g" id="h-wr">—</span></div>
   <div class="conn"><div class="dot" id="cdot"></div><span id="ctxt">Connecting…</span></div>
 </header>
 
@@ -167,7 +188,7 @@ svg#spark{width:100%;height:36px;display:block;margin:8px 0}
   </div>
 
   <!-- MIDDLE: MAS FEED -->
-  <div class="panel">
+  <div class="panel feed-panel">
     <div class="pt">
       🧠 MAS Brain Feed
       <span style="margin-left:auto;font-size:9px" id="fc">0 signals</span>
