@@ -34,8 +34,9 @@ ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 BITGET_API_KEY    = os.getenv("BITGET_API_KEY", "")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
 BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
-PAPER_MODE        = os.getenv("PAPER_MODE", "true").lower() != "false"
-TRADE_CAPITAL_USDT = float(os.getenv("TRADE_CAPITAL_USDT", "1"))  # editable via /settrade
+PAPER_MODE         = os.getenv("PAPER_MODE", "true").lower() != "false"
+TRADE_CAPITAL_USDT = float(os.getenv("TRADE_CAPITAL_USDT", "1"))   # editable via /settrade
+DEMO_BALANCE_USDT  = float(os.getenv("DEMO_BALANCE_USDT", "100"))  # starting demo wallet
 
 # Alert thresholds
 SIGNAL_MIN_CONF   = int(os.getenv("MIN_CONFIDENCE", "62"))   # minimum confidence to alert
@@ -62,7 +63,11 @@ _executor = BitgetExecutor(
     passphrase=BITGET_PASSPHRASE,
     paper=PAPER_MODE,
 )
-engine = PlatiniumEngine(executor=_executor)
+engine = PlatiniumEngine(
+    executor=_executor,
+    trade_size_usdt=TRADE_CAPITAL_USDT,
+    demo_balance=DEMO_BALANCE_USDT,
+)
 last_signal_id: Optional[str] = None
 last_edge_level: int = 0
 last_equity_alert: float = 100.0
@@ -147,13 +152,16 @@ def fmt_edge(edge) -> str:
 
 
 def fmt_equity(sim_summary: dict) -> str:
-    s  = sim_summary
-    ep = pnl_emoji(s["pnl_pct"])
+    s   = sim_summary
+    ep  = pnl_emoji(s["pnl_pct"])
+    tag = "📄 Demo" if PAPER_MODE else "💸 Live"
+    pnl_u = s.get("pnl_usdt", 0)
+    usdt_str = escape(f"{'+'  if pnl_u >= 0 else ''}{pnl_u} USDT")
     return "\n".join([
-        f"{ep} *Equity Update*",
+        f"{ep} *{escape(tag)} — Equity Update*",
         f"",
-        f"💰 Balance: *{fmt_num(s['balance'])}*",
-        f"📈 P&L: *{'+' if s['pnl_pct']>=0 else ''}{s['pnl_pct']}%*",
+        f"💰 Balance: *{fmt_num(s['balance'])}*  \\(started {fmt_num(s['start_balance'])}\\)",
+        f"📈 P&L: *{'+' if s['pnl_pct']>=0 else ''}{s['pnl_pct']}%*  \\({usdt_str}\\)",
         f"🏔 Peak: *{fmt_num(s['peak'])}*",
         f"📉 Drawdown: *{s['drawdown']}%*",
         f"🎯 Win Rate: *{s['wr']}%*",
@@ -229,20 +237,23 @@ def fmt_live_trade(lt: LiveTradeState, btc: float) -> str:
 
 
 def fmt_trade_close(ev: dict) -> str:
-    e = "✅" if ev["win"] else "❌"
-    mode = "PAPER" if ev["paper"] else "LIVE"
-    pnl = f"{'\\+' if ev['pnl_pct'] >= 0 else ''}{ev['pnl_pct']}%"
-    usdt = f"{'\\+' if ev['pnl_usdt'] >= 0 else ''}{ev['pnl_usdt']} USDT"
-    return "\n".join([
+    e    = "✅" if ev["win"] else "❌"
+    mode = "📄 DEMO" if ev["paper"] else "💸 LIVE"
+    pnl  = escape(f"{'+'  if ev['pnl_pct']  >= 0 else ''}{ev['pnl_pct']}%")
+    usdt = escape(f"{'+'  if ev['pnl_usdt'] >= 0 else ''}{ev['pnl_usdt']} USDT")
+    lines = [
         f"{e} *Trade Closed — {escape(mode)}*",
         f"",
         f"{'🟢' if ev['direction']=='LONG' else '🔴'} {escape(ev['direction'])} — {escape(ev['pattern'])}",
         f"",
-        f"📥 Entry:  {fmt_num(ev['entry'])}",
-        f"📤 Exit:   {fmt_num(ev['exit'])}",
-        f"💰 P&L:    *{escape(pnl)}* \\({escape(usdt)}\\)",
+        f"📥 Entry:    {fmt_num(ev['entry'])}",
+        f"📤 Exit:     {fmt_num(ev['exit'])}",
+        f"💰 P&L:      *{pnl}*  \\({usdt}\\)",
         f"⏱ Duration: {ev['duration']}m",
-    ])
+    ]
+    if ev.get("demo_balance") is not None:
+        lines.append(f"💼 Demo wallet: *{fmt_num(ev['demo_balance'])}*")
+    return "\n".join(lines)
 
 
 def fmt_daily(summary: dict) -> str:
@@ -457,6 +468,7 @@ async def cmd_settrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if val <= 0:
             raise ValueError
         TRADE_CAPITAL_USDT = val
+        engine.trade_size_usdt = val
         log.info(f"Trade capital set to ${val} by user {user_id}")
         await update.message.reply_text(
             f"✅ *Trade size set to {fmt_num(TRADE_CAPITAL_USDT)} per trade*",

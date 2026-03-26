@@ -574,15 +574,21 @@ MAX_LEVERAGE = 10
 
 @dataclass
 class SimState:
-    balance: float = 100.0
-    peak: float = 100.0
+    start_balance: float = 100.0
+    balance: float = field(init=False)
+    peak: float = field(init=False)
     wins: int = 0
     losses: int = 0
     total: int = 0
     cons_loss: int = 0
     cons_win: int = 0
-    curve: list = field(default_factory=lambda: [100.0])
+    curve: list = field(default_factory=list)
     trades: list = field(default_factory=list)
+
+    def __post_init__(self):
+        self.balance = self.start_balance
+        self.peak    = self.start_balance
+        self.curve   = [self.start_balance]
 
     @property
     def wr(self) -> float:
@@ -594,7 +600,7 @@ class SimState:
 
     @property
     def pnl_pct(self) -> float:
-        return round((self.balance - 100) / 100 * 100, 1)
+        return round((self.balance - self.start_balance) / self.start_balance * 100, 1)
 
 
 def get_lev(acc: float) -> int:
@@ -614,13 +620,14 @@ def pos_size(sim: SimState, acc: float) -> float:
 
 
 def execute_trade(sim: SimState, db: Database, rec: PatternRecord,
-                  r: Readings, a: AstroState) -> Optional[dict]:
+                  r: Readings, a: AstroState,
+                  size_usdt: float = 1.0) -> Optional[dict]:
     if sim.balance < MIN_BALANCE:
         return None
 
     pat = rec.pattern
     acc = rec.acc or 50
-    size = pos_size(sim, acc)
+    size = size_usdt          # fixed size — same as live trade capital
     lev = get_lev(acc)
 
     # Win probability — real factors
@@ -853,15 +860,18 @@ class BitgetExecutor:
 # ═══════════════════════════════════════════════
 
 class PlatiniumEngine:
-    def __init__(self, executor: Optional[BitgetExecutor] = None):
+    def __init__(self, executor: Optional[BitgetExecutor] = None,
+                 trade_size_usdt: float = 1.0,
+                 demo_balance: float = 100.0):
         self.live_price = LivePrice()
         self.price_history = PriceHistory()
         self.db = Database()
-        self.sim = SimState()
+        self.sim = SimState(start_balance=demo_balance)
         self.tick_count = 0
         self.polymarket = PolymarketState()
         self.executor = executor or BitgetExecutor()
         self.live_trade = LiveTradeState()
+        self.trade_size_usdt = trade_size_usdt
 
     async def update_polymarket(self, session: aiohttp.ClientSession):
         """Fetch fresh Polymarket sentiment."""
@@ -926,16 +936,36 @@ class PlatiniumEngine:
 
         pnl_usdt = round(lt.size_usdt * pnl_pct / 100, 2)
         duration = round((time.time() - lt.opened_at) / 60, 1)
+
+        # Update demo balance — paper trades affect the sim wallet exactly like real
+        if lt.paper:
+            new_bal = max(0.0, self.sim.balance + pnl_usdt)
+            self.sim.balance = new_bal
+            self.sim.peak    = max(self.sim.peak, new_bal)
+            self.sim.total  += 1
+            self.sim.curve.append(round(new_bal, 2))
+            if len(self.sim.curve) > 500:
+                self.sim.curve = self.sim.curve[-300:]
+            if win:
+                self.sim.wins += 1
+                self.sim.cons_loss = 0
+                self.sim.cons_win += 1
+            else:
+                self.sim.losses += 1
+                self.sim.cons_loss += 1
+                self.sim.cons_win = 0
+
         event = {
-            "pattern":   lt.pattern,
-            "direction": "LONG" if lt.direction == 1 else "SHORT",
-            "entry":     lt.entry,
-            "exit":      round(price, 2),
-            "pnl_pct":   round(pnl_pct, 2),
-            "pnl_usdt":  pnl_usdt,
-            "win":       win,
-            "duration":  duration,
-            "paper":     lt.paper,
+            "pattern":      lt.pattern,
+            "direction":    "LONG" if lt.direction == 1 else "SHORT",
+            "entry":        lt.entry,
+            "exit":         round(price, 2),
+            "pnl_pct":      round(pnl_pct, 2),
+            "pnl_usdt":     pnl_usdt,
+            "win":          win,
+            "duration":     duration,
+            "paper":        lt.paper,
+            "demo_balance": round(self.sim.balance, 2),
         }
         self.live_trade = LiveTradeState()  # reset
         return event
@@ -968,7 +998,7 @@ class PlatiniumEngine:
         rec = self.db.find_best(r, a)
         trade = None
         if rec and self.sim.balance > MIN_BALANCE:
-            trade = execute_trade(self.sim, self.db, rec, r, a)
+            trade = execute_trade(self.sim, self.db, rec, r, a, self.trade_size_usdt)
 
         return trade
 
@@ -1034,23 +1064,26 @@ class PlatiniumEngine:
 
     def get_summary(self) -> dict:
         edge = self.get_edge()
+        pnl_usdt = round(self.sim.balance - self.sim.start_balance, 2)
         return {
-            "balance":    round(self.sim.balance, 2),
-            "peak":       round(self.sim.peak, 2),
-            "pnl_pct":    self.sim.pnl_pct,
-            "drawdown":   self.sim.drawdown,
-            "wr":         self.sim.wr,
-            "total":      self.sim.total,
-            "wins":       self.sim.wins,
-            "losses":     self.sim.losses,
-            "cons_loss":  self.sim.cons_loss,
-            "cons_win":   self.sim.cons_win,
-            "edge_score": edge.score,
-            "edge_status":edge.status,
-            "db_size":    edge.db_size,
-            "elite":      edge.elite,
-            "btc":        round(self.live_price.btc, 2),
-            "btc_chg":    round(self.live_price.chg, 2),
-            "astro":      self.get_astro(),
-            "last_trades":self.sim.trades[:5],
+            "balance":       round(self.sim.balance, 2),
+            "start_balance": round(self.sim.start_balance, 2),
+            "pnl_usdt":      pnl_usdt,
+            "peak":          round(self.sim.peak, 2),
+            "pnl_pct":       self.sim.pnl_pct,
+            "drawdown":      self.sim.drawdown,
+            "wr":            self.sim.wr,
+            "total":         self.sim.total,
+            "wins":          self.sim.wins,
+            "losses":        self.sim.losses,
+            "cons_loss":     self.sim.cons_loss,
+            "cons_win":      self.sim.cons_win,
+            "edge_score":    edge.score,
+            "edge_status":   edge.status,
+            "db_size":       edge.db_size,
+            "elite":         edge.elite,
+            "btc":           round(self.live_price.btc, 2),
+            "btc_chg":       round(self.live_price.chg, 2),
+            "astro":         self.get_astro(),
+            "last_trades":   self.sim.trades[:5],
         }
