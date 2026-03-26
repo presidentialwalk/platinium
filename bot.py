@@ -695,15 +695,21 @@ async def engine_loop(app: Application):
     session = aiohttp.ClientSession()
     log.info("Engine loop started")
 
-    price_tick = 0
+    price_tick   = 0
+    onchain_tick = 0
 
     while True:
         try:
             # Fetch price every PRICE_INTERVAL seconds
-            price_tick += TICK_INTERVAL
+            price_tick   += TICK_INTERVAL
+            onchain_tick += TICK_INTERVAL
             if price_tick >= PRICE_INTERVAL:
                 await engine.update_price(session)
                 price_tick = 0
+            # Refresh real on-chain data every 5 minutes
+            if onchain_tick >= 300:
+                await engine.refresh_onchain(session)
+                onchain_tick = 0
 
             # ── CHECK OPEN TRADE ──────────────────────
             close_ev = await engine.check_and_close_live_trade(session)

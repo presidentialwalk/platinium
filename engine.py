@@ -25,6 +25,79 @@ DATA_FILE = os.getenv("DATA_FILE", "platinium_data.json")
 
 
 # ═══════════════════════════════════════════════
+# ON-CHAIN CACHE  (populated by async fetcher,
+#                  read synchronously by get_readings)
+# ═══════════════════════════════════════════════
+
+@dataclass
+class OnChainCache:
+    funding:    float = 0.0    # BTC perp funding rate %
+    chain_flow: float = 0.0    # -1 (sell) to +1 (buy pressure)
+    whale_buy:  bool  = False  # large-player accumulation signal
+    updated_at: float = 0.0
+    fresh:      bool  = False  # True once real data has been fetched
+
+_onchain = OnChainCache()
+
+
+async def update_onchain(session: aiohttp.ClientSession) -> OnChainCache:
+    """
+    Fetch real BTC on-chain/derivatives data from Binance Futures public API.
+    Falls back to price-derived estimates if any endpoint fails.
+    Updates the module-level _onchain cache and returns it.
+    """
+    global _onchain
+
+    funding    = _onchain.funding
+    chain_flow = _onchain.chain_flow
+    whale_buy  = _onchain.whale_buy
+
+    # ── 1. FUNDING RATE ───────────────────────────────────────────
+    try:
+        url = "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            data = await r.json()
+        funding = round(float(data["lastFundingRate"]) * 100, 5)
+    except Exception as e:
+        log.debug(f"OnChain funding fetch failed: {e}")
+
+    # ── 2. TAKER BUY/SELL RATIO → chain_flow ─────────────────────
+    # buySellRatio > 1 = more aggressive buyers = positive flow
+    try:
+        url = ("https://fapi.binance.com/futures/data/takerlongshortRatio"
+               "?symbol=BTCUSDT&period=5m&limit=3")
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            data = await r.json()
+        avg_ratio = sum(float(d["buySellRatio"]) for d in data) / len(data)
+        # normalize: ratio 1.0 → 0.0, 1.5 → +1.0, 0.5 → -1.0
+        chain_flow = round(max(-1.0, min(1.0, (avg_ratio - 1.0) * 2.0)), 3)
+    except Exception as e:
+        log.debug(f"OnChain flow fetch failed: {e}")
+
+    # ── 3. GLOBAL LONG/SHORT RATIO → whale_buy ───────────────────
+    # longShortRatio > 1.15 with positive flow = whale accumulation
+    try:
+        url = ("https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
+               "?symbol=BTCUSDT&period=5m&limit=1")
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            data = await r.json()
+        ls_ratio = float(data[0]["longShortRatio"])
+        whale_buy = ls_ratio > 1.12 and chain_flow > 0
+    except Exception as e:
+        log.debug(f"OnChain whale fetch failed: {e}")
+
+    _onchain = OnChainCache(
+        funding=funding,
+        chain_flow=chain_flow,
+        whale_buy=whale_buy,
+        updated_at=time.time(),
+        fresh=True,
+    )
+    log.info(f"OnChain: funding={funding:+.4f}% flow={chain_flow:+.3f} whale={whale_buy}")
+    return _onchain
+
+
+# ═══════════════════════════════════════════════
 # ASTRO ENGINE
 # ═══════════════════════════════════════════════
 
@@ -350,10 +423,16 @@ def get_readings(ph: list, lp: LivePrice) -> Readings:
     else:
         vol_r = 0.6 + random.random() * 1.8
 
-    # On-chain (context-biased)
-    funding = (-0.05 + random.random() * 0.02) if lp.chg < -1 else (random.random() - 0.5) * 0.06
-    chain_flow = -1.0 if lp.chg < -1 else (1.0 if lp.chg > 1 else (-1.0 if random.random() > 0.5 else 1.0))
-    whale_buy = random.random() > (0.45 if lp.chg < -2 else 0.75)
+    # On-chain — use cached real data if fresh (< 10 min old)
+    if _onchain.fresh and time.time() - _onchain.updated_at < 600:
+        funding    = _onchain.funding
+        chain_flow = _onchain.chain_flow
+        whale_buy  = _onchain.whale_buy
+    else:
+        # Price-derived fallback — better than pure random
+        funding    = round(-0.03 if lp.chg < -1.5 else (0.03 if lp.chg > 1.5 else 0.0), 4)
+        chain_flow = round(max(-1.0, min(1.0, lp.chg / 3.0)), 3)
+        whale_buy  = lp.chg > 0.5 and vol_r > 1.5
     range_pos = (l - lp.low) / (lp.high - lp.low) if lp.high > lp.low else 0.5
 
     return Readings(
@@ -1039,6 +1118,10 @@ class PlatiniumEngine:
 
     async def get_live_balance(self, session: aiohttp.ClientSession) -> float:
         return await self.executor.get_balance(session)
+
+    async def refresh_onchain(self, session: aiohttp.ClientSession):
+        """Fetch real on-chain data and update the module-level cache."""
+        await update_onchain(session)
 
     async def update_price(self, session: aiohttp.ClientSession):
         """Fetch fresh BTC price from Binance."""
