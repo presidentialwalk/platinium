@@ -10,6 +10,9 @@ import time
 import random
 import asyncio
 import aiohttp
+import hmac
+import hashlib
+import base64
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
@@ -704,17 +707,161 @@ class PriceHistory:
 
 
 # ═══════════════════════════════════════════════
+# BITGET EXECUTION LAYER
+# ═══════════════════════════════════════════════
+
+BITGET_BASE = "https://api.bitget.com"
+
+
+@dataclass
+class LiveTradeState:
+    active: bool = False
+    order_id: str = ""
+    direction: int = 0       # 1=long, -1=short
+    entry: float = 0.0
+    stop: float = 0.0
+    target: float = 0.0
+    size_usdt: float = 0.0
+    pattern: str = ""
+    opened_at: float = 0.0
+    paper: bool = True        # True = simulated, False = real money
+
+
+class BitgetExecutor:
+    def __init__(self, api_key: str = "", secret: str = "", passphrase: str = "",
+                 paper: bool = True):
+        self.api_key = api_key
+        self.secret = secret
+        self.passphrase = passphrase
+        self.paper = paper
+        self.enabled = bool(api_key and secret and passphrase)
+
+    def _sign(self, timestamp: str, method: str, path: str, body: str = "") -> str:
+        msg = f"{timestamp}{method.upper()}{path}{body}"
+        sig = hmac.new(self.secret.encode(), msg.encode(), hashlib.sha256).digest()
+        return base64.b64encode(sig).decode()
+
+    def _headers(self, method: str, path: str, body: str = "") -> dict:
+        ts = str(int(time.time() * 1000))
+        return {
+            "ACCESS-KEY":        self.api_key,
+            "ACCESS-SIGN":       self._sign(ts, method, path, body),
+            "ACCESS-TIMESTAMP":  ts,
+            "ACCESS-PASSPHRASE": self.passphrase,
+            "Content-Type":      "application/json",
+            "locale":            "en-US",
+        }
+
+    async def get_balance(self, session: aiohttp.ClientSession) -> float:
+        """Return available USDT balance on Bitget futures."""
+        if not self.enabled:
+            return 0.0
+        path = "/api/v2/mix/account/account?symbol=BTCUSDT&productType=USDT-FUTURES&marginCoin=USDT"
+        try:
+            async with session.get(
+                BITGET_BASE + path,
+                headers=self._headers("GET", path),
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as r:
+                data = await r.json()
+            return float(data.get("data", {}).get("available", 0))
+        except Exception:
+            return 0.0
+
+    async def place_order(self, session: aiohttp.ClientSession,
+                          direction: int, size_usdt: float,
+                          price: float, stop: float, target: float) -> dict:
+        """Open a market order with attached TP/SL. Returns order info dict."""
+        if self.paper or not self.enabled:
+            return {"paper": True, "orderId": f"PAPER-{int(time.time())}"}
+
+        side      = "buy"  if direction == 1 else "sell"
+        hold_side = "long" if direction == 1 else "short"
+        size_btc  = round(size_usdt / price, 4)
+
+        body = json.dumps({
+            "symbol":                "BTCUSDT",
+            "productType":           "USDT-FUTURES",
+            "marginMode":            "isolated",
+            "marginCoin":            "USDT",
+            "size":                  str(size_btc),
+            "side":                  side,
+            "tradeSide":             "open",
+            "orderType":             "market",
+            "presetStopLossPrice":   str(round(stop, 2)),
+            "presetTakeProfitPrice": str(round(target, 2)),
+        })
+        path = "/api/v2/mix/order/placeOrder"
+        try:
+            async with session.post(
+                BITGET_BASE + path,
+                headers=self._headers("POST", path, body),
+                data=body,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                data = await r.json()
+            order_id = data.get("data", {}).get("orderId", "")
+            return {"paper": False, "orderId": order_id, "raw": data}
+        except Exception as e:
+            return {"paper": False, "orderId": "", "error": str(e)}
+
+    async def close_position(self, session: aiohttp.ClientSession, direction: int) -> dict:
+        """Close the open long or short position at market."""
+        if self.paper or not self.enabled:
+            return {"paper": True}
+
+        hold_side = "long" if direction == 1 else "short"
+        body = json.dumps({
+            "symbol":      "BTCUSDT",
+            "productType": "USDT-FUTURES",
+            "holdSide":    hold_side,
+        })
+        path = "/api/v2/mix/order/closePositions"
+        try:
+            async with session.post(
+                BITGET_BASE + path,
+                headers=self._headers("POST", path, body),
+                data=body,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                return await r.json()
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def get_position(self, session: aiohttp.ClientSession) -> dict:
+        """Return current open BTC position (empty dict if none)."""
+        if not self.enabled:
+            return {}
+        path = "/api/v2/mix/position/singlePosition?symbol=BTCUSDT&productType=USDT-FUTURES&marginCoin=USDT"
+        try:
+            async with session.get(
+                BITGET_BASE + path,
+                headers=self._headers("GET", path),
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as r:
+                data = await r.json()
+            positions = data.get("data", [])
+            if positions and float(positions[0].get("total", 0)) > 0:
+                return positions[0]
+            return {}
+        except Exception:
+            return {}
+
+
+# ═══════════════════════════════════════════════
 # PLATINIUM ENGINE (main orchestrator)
 # ═══════════════════════════════════════════════
 
 class PlatiniumEngine:
-    def __init__(self):
+    def __init__(self, executor: Optional[BitgetExecutor] = None):
         self.live_price = LivePrice()
         self.price_history = PriceHistory()
         self.db = Database()
         self.sim = SimState()
         self.tick_count = 0
         self.polymarket = PolymarketState()
+        self.executor = executor or BitgetExecutor()
+        self.live_trade = LiveTradeState()
 
     async def update_polymarket(self, session: aiohttp.ClientSession):
         """Fetch fresh Polymarket sentiment."""
@@ -722,6 +869,82 @@ class PlatiniumEngine:
 
     def get_polymarket(self) -> PolymarketState:
         return self.polymarket
+
+    def get_live_trade(self) -> LiveTradeState:
+        return self.live_trade
+
+    async def open_live_trade(self, session: aiohttp.ClientSession,
+                               sig: dict) -> LiveTradeState:
+        """Open a real or paper trade from a signal dict."""
+        if self.live_trade.active:
+            return self.live_trade
+        size_usdt = self.executor.paper and 100.0 or max(
+            10.0, self.sim.balance * 0.10
+        )
+        direction = 1 if sig["direction"] == "LONG" else -1
+        result = await self.executor.place_order(
+            session, direction,
+            size_usdt, sig["entry"], sig["stop"], sig["target"]
+        )
+        self.live_trade = LiveTradeState(
+            active=True,
+            order_id=result.get("orderId", ""),
+            direction=direction,
+            entry=sig["entry"],
+            stop=sig["stop"],
+            target=sig["target"],
+            size_usdt=size_usdt,
+            pattern=sig["pattern"],
+            opened_at=time.time(),
+            paper=self.executor.paper,
+        )
+        return self.live_trade
+
+    async def check_and_close_live_trade(self, session: aiohttp.ClientSession) -> Optional[dict]:
+        """
+        Check if active trade hit TP/SL. Returns close-event dict or None.
+        For paper trades uses live price; for real trades checks Bitget position.
+        """
+        if not self.live_trade.active:
+            return None
+
+        lt = self.live_trade
+        price = self.live_price.btc
+
+        if lt.paper:
+            hit_tp = (lt.direction == 1 and price >= lt.target) or \
+                     (lt.direction == -1 and price <= lt.target)
+            hit_sl = (lt.direction == 1 and price <= lt.stop) or \
+                     (lt.direction == -1 and price >= lt.stop)
+            if not (hit_tp or hit_sl):
+                return None
+            win = hit_tp
+            pnl_pct = ((price - lt.entry) / lt.entry * 100 * lt.direction)
+        else:
+            pos = await self.executor.get_position(session)
+            if pos:
+                return None  # still open
+            win = price > lt.entry if lt.direction == 1 else price < lt.entry
+            pnl_pct = round((price - lt.entry) / lt.entry * 100 * lt.direction, 2)
+
+        pnl_usdt = round(lt.size_usdt * pnl_pct / 100, 2)
+        duration = round((time.time() - lt.opened_at) / 60, 1)
+        event = {
+            "pattern":   lt.pattern,
+            "direction": "LONG" if lt.direction == 1 else "SHORT",
+            "entry":     lt.entry,
+            "exit":      round(price, 2),
+            "pnl_pct":   round(pnl_pct, 2),
+            "pnl_usdt":  pnl_usdt,
+            "win":       win,
+            "duration":  duration,
+            "paper":     lt.paper,
+        }
+        self.live_trade = LiveTradeState()  # reset
+        return event
+
+    async def get_live_balance(self, session: aiohttp.ClientSession) -> float:
+        return await self.executor.get_balance(session)
 
     async def update_price(self, session: aiohttp.ClientSession):
         """Fetch fresh BTC price from Binance."""

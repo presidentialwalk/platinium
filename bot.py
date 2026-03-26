@@ -21,13 +21,21 @@ from telegram.constants import ParseMode
 
 from engine import (
     PlatiniumEngine, fetch_price, fetch_klines, get_astro,
-    get_readings, PATTERNS, calc_edge, LivePrice, PolymarketState
+    get_readings, PATTERNS, calc_edge, LivePrice, PolymarketState,
+    BitgetExecutor, LiveTradeState
 )
 
 # ── CONFIG ──────────────────────────────────────────────────────
 TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TOKEN_HERE")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")       # your personal chat ID
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+
+# Bitget execution
+BITGET_API_KEY    = os.getenv("BITGET_API_KEY", "")
+BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
+BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
+PAPER_MODE        = os.getenv("PAPER_MODE", "true").lower() != "false"
+TRADE_CAPITAL_USDT = float(os.getenv("TRADE_CAPITAL_USDT", "50"))
 
 # Alert thresholds
 SIGNAL_MIN_CONF   = int(os.getenv("MIN_CONFIDENCE", "62"))   # minimum confidence to alert
@@ -48,7 +56,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── GLOBALS ──────────────────────────────────────────────────────
-engine = PlatiniumEngine()
+_executor = BitgetExecutor(
+    api_key=BITGET_API_KEY,
+    secret=BITGET_API_SECRET,
+    passphrase=BITGET_PASSPHRASE,
+    paper=PAPER_MODE,
+)
+engine = PlatiniumEngine(executor=_executor)
 last_signal_id: Optional[str] = None
 last_edge_level: int = 0
 last_equity_alert: float = 100.0
@@ -194,6 +208,43 @@ def fmt_polymarket(pm: PolymarketState) -> str:
     return "\n".join(lines)
 
 
+def fmt_live_trade(lt: LiveTradeState, btc: float) -> str:
+    mode = "📄 PAPER" if lt.paper else "💸 LIVE"
+    d = "🟢 LONG" if lt.direction == 1 else "🔴 SHORT"
+    dur = round((time.time() - lt.opened_at) / 60, 1)
+    dist_tp = round(abs(btc - lt.target) / lt.entry * 100, 2)
+    dist_sl = round(abs(btc - lt.stop) / lt.entry * 100, 2)
+    return "\n".join([
+        f"⚡ *Open Trade — {mode}*",
+        f"",
+        f"{d} — {escape(lt.pattern)}",
+        f"",
+        f"📥 *Entry:*  {fmt_num(lt.entry)}",
+        f"₿ *Now:*   {fmt_num(btc)}",
+        f"🎯 *Target:* {fmt_num(lt.target)} \\({dist_tp}% away\\)",
+        f"🛑 *Stop:*   {fmt_num(lt.stop)} \\({dist_sl}% away\\)",
+        f"💼 *Size:*   {fmt_num(lt.size_usdt)}",
+        f"⏱ *Open:*  {dur}m",
+    ])
+
+
+def fmt_trade_close(ev: dict) -> str:
+    e = "✅" if ev["win"] else "❌"
+    mode = "PAPER" if ev["paper"] else "LIVE"
+    pnl = f"{'\\+' if ev['pnl_pct'] >= 0 else ''}{ev['pnl_pct']}%"
+    usdt = f"{'\\+' if ev['pnl_usdt'] >= 0 else ''}{ev['pnl_usdt']} USDT"
+    return "\n".join([
+        f"{e} *Trade Closed — {escape(mode)}*",
+        f"",
+        f"{'🟢' if ev['direction']=='LONG' else '🔴'} {escape(ev['direction'])} — {escape(ev['pattern'])}",
+        f"",
+        f"📥 Entry:  {fmt_num(ev['entry'])}",
+        f"📤 Exit:   {fmt_num(ev['exit'])}",
+        f"💰 P&L:    *{escape(pnl)}* \\({escape(usdt)}\\)",
+        f"⏱ Duration: {ev['duration']}m",
+    ])
+
+
 def fmt_daily(summary: dict) -> str:
     s = summary
     a = s["astro"]
@@ -235,7 +286,8 @@ def main_keyboard():
          InlineKeyboardButton("🌌 Astro",  callback_data="astro")],
         [InlineKeyboardButton("🔍 Search Coin", callback_data="search_prompt"),
          InlineKeyboardButton("📋 Summary",     callback_data="summary")],
-        [InlineKeyboardButton("📊 Polymarket",  callback_data="polymarket")],
+        [InlineKeyboardButton("📊 Polymarket",  callback_data="polymarket"),
+         InlineKeyboardButton("⚡ Trades",      callback_data="trades")],
     ])
 
 
@@ -357,17 +409,25 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     h = int(uptime // 3600)
     m = int((uptime % 3600) // 60)
     s = engine.get_summary()
+    lt = engine.get_live_trade()
+    trade_line = f"⚡ Trade: *{'OPEN — ' + escape(lt.pattern) if lt.active else 'none'}*"
+    mode_line  = f"💸 Mode: *{'PAPER' if PAPER_MODE else 'LIVE — REAL MONEY'}*"
+    bitget_line = f"🔑 Bitget: *{'✅ ' + ('paper' if PAPER_MODE else 'live') if _executor.enabled else '⚠️ keys not set'}*"
     txt = "\n".join([
         "✅ *PLATINIUM Status*",
         "",
         f"⏱ Uptime: *{h}h {m}m*",
         f"🎯 Tick count: *{engine.tick_count}*",
-        f"💰 Balance: *{fmt_num(s['balance'])}*",
+        f"💰 Sim Balance: *{fmt_num(s['balance'])}*",
         f"₿ BTC: *{fmt_num(s['btc'])}* \\({'+' if s['btc_chg']>=0 else ''}{s['btc_chg']}%\\)",
-        f"📦 DB: *{s['db_size']}/41 patterns*",
+        f"📦 DB: *{s['db_size']}/44 patterns*",
         f"🔬 Edge: *{s['edge_score']} — {escape(s['edge_status'])}*",
         f"📡 Live price: *{'✅' if engine.live_price.fresh else '⚠️ simulated'}*",
         f"👥 Subscribers: *{len(subscribed_chats)}*",
+        f"",
+        trade_line,
+        mode_line,
+        bitget_line,
     ])
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN_V2)
 
@@ -376,6 +436,25 @@ async def cmd_polymarket(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pm = engine.get_polymarket()
     await update.message.reply_text(
         fmt_polymarket(pm), parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=main_keyboard())
+
+
+async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    lt = engine.get_live_trade()
+    if not lt.active:
+        mode = "PAPER" if PAPER_MODE else "LIVE"
+        bitget_ok = "✅ Connected" if _executor.enabled else "⚠️ No keys set"
+        await update.message.reply_text(
+            f"📭 *No open trade right now*\n\n"
+            f"Mode: *{escape(mode)}*\n"
+            f"Bitget: *{escape(bitget_ok)}*\n"
+            f"Capital per trade: *{fmt_num(TRADE_CAPITAL_USDT)}*",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=main_keyboard())
+        return
+    await update.message.reply_text(
+        fmt_live_trade(lt, engine.live_price.btc),
+        parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=main_keyboard())
 
 
@@ -420,6 +499,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "polymarket":
         await reply(fmt_polymarket(engine.get_polymarket()),
                     parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
+
+    elif data == "trades":
+        lt = engine.get_live_trade()
+        if lt.active:
+            await reply(fmt_live_trade(lt, engine.live_price.btc),
+                        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
+        else:
+            await reply("📭 *No open trade right now*",
+                        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
 
     elif data == "back":
         await reply("🔱 *PLATINIUM*\n\nWhat do you need?",
@@ -562,16 +650,27 @@ async def engine_loop(app: Application):
                 log.info(f"Polymarket updated: {engine.polymarket.bull_pct}% bull, {len(engine.polymarket.markets)} markets")
                 polymarket_tick = 0
 
+            # ── CHECK OPEN TRADE ──────────────────────
+            close_ev = await engine.check_and_close_live_trade(session)
+            if close_ev:
+                log.info(f"Trade closed: {close_ev['direction']} {close_ev['pattern']} pnl={close_ev['pnl_pct']}%")
+                await broadcast(app, fmt_trade_close(close_ev))
+
             # Tick the engine
             trade = engine.tick()
 
-            # ── SIGNAL ALERT ──────────────────────────
+            # ── SIGNAL ALERT + TRADE OPEN ─────────────
             sig = engine.get_signal()
             if sig and sig["pattern"] != last_signal_id:
                 if sig["confidence"] >= SIGNAL_MIN_CONF and sig["accuracy"] >= SIGNAL_MIN_ACC:
                     last_signal_id = sig["pattern"]
                     log.info(f"Signal fired: {sig['direction']} {sig['pattern']} conf={sig['confidence']}")
                     await broadcast(app, fmt_signal(sig, engine.live_price.btc))
+                    # Open live / paper trade
+                    if not engine.live_trade.active:
+                        lt = await engine.open_live_trade(session, sig)
+                        mode = "PAPER" if lt.paper else "LIVE"
+                        log.info(f"Trade opened [{mode}]: {lt.pattern} order={lt.order_id}")
             elif not sig:
                 last_signal_id = None
 
@@ -696,6 +795,7 @@ def main():
     app.add_handler(CommandHandler("stop",       cmd_stop))
     app.add_handler(CommandHandler("status",     cmd_status))
     app.add_handler(CommandHandler("polymarket", cmd_polymarket))
+    app.add_handler(CommandHandler("trades",     cmd_trades))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))
