@@ -109,19 +109,20 @@ def escape(txt: str) -> str:
 def fmt_signal(sig: dict, lp_btc: float) -> str:
     d  = sig["direction"]
     de = dir_emoji(d)
+    ev_sign = "+" if sig['ev'] > 0 else ""
     lines = [
         f"{de} *{escape(d)} — {escape(sig['pattern'])}*",
         f"",
         f"📊 *Category:* {escape(sig['category'])}",
         f"🎯 *Accuracy:* {sig['accuracy']}%",
         f"⚡ *Confidence:* {sig['confidence']}/100",
-        f"📈 *Avg EV:* {'+' if sig['ev']>0 else ''}{sig['ev']}%",
+        f"📈 *Avg EV:* {escape(f'{ev_sign}{sig[\"ev\"]}%')}",
         f"👁 *Seen:* {sig['observations']} times",
         f"",
-        f"💰 *Entry:* {fmt_num(sig['entry'])}",
-        f"🛑 *Stop Loss:* {fmt_num(sig['stop'])}",
-        f"🎯 *Target:* {fmt_num(sig['target'])}",
-        f"⚖️ *R:R:* {sig['rr']}:1",
+        f"💰 *Entry:* {escape(fmt_num(sig['entry']))}",
+        f"🛑 *Stop Loss:* {escape(fmt_num(sig['stop']))}",
+        f"🎯 *Target:* {escape(fmt_num(sig['target']))}",
+        f"⚖️ *R:R:* {escape(str(sig['rr']))}:1",
         f"🔢 *Leverage:* {sig['leverage']}×",
     ]
     if sig.get("why"):
@@ -130,7 +131,7 @@ def fmt_signal(sig: dict, lp_btc: float) -> str:
             lines.append(f"  • {escape(w)}")
     if sig.get("merc_rx"):
         lines += ["", "⚠️ *Mercury Retrograde active — reduce size 40%*"]
-    lines += ["", f"₿ BTC: {fmt_num(lp_btc)}"]
+    lines += ["", f"₿ BTC: {escape(fmt_num(lp_btc))}"]
     return "\n".join(lines)
 
 
@@ -150,23 +151,35 @@ def fmt_edge(edge) -> str:
 
 
 def fmt_equity(sim_summary: dict) -> str:
-    s   = sim_summary
-    ep  = pnl_emoji(s["pnl_pct"])
-    tag = "📄 Demo" if PAPER_MODE else "💸 Live"
-    pnl_u = s.get("pnl_usdt", 0)
-    usdt_str = escape(f"{'+'  if pnl_u >= 0 else ''}{pnl_u} USDT")
-    return "\n".join([
-        f"{ep} *{escape(tag)} — Equity Update*",
-        f"",
-        f"💰 Balance: *{fmt_num(s['balance'])}*  \\(started {fmt_num(s['start_balance'])}\\)",
-        f"📈 P&L: *{'+' if s['pnl_pct']>=0 else ''}{s['pnl_pct']}%*  \\({usdt_str}\\)",
-        f"🏔 Peak: *{fmt_num(s['peak'])}*",
-        f"📉 Drawdown: *{s['drawdown']}%*",
-        f"🎯 Win Rate: *{s['wr']}%*",
-        f"📊 Trades: *{s['total']}* \\({s['wins']}W / {s['losses']}L\\)",
-        f"🔥 Streak: *{s['cons_win']}W* winning" if s['cons_win'] > 1 else
-        f"❄️ Streak: *{s['cons_loss']}L* losing" if s['cons_loss'] > 1 else "",
-    ])
+    s      = sim_summary
+    ep     = pnl_emoji(s["pnl_pct"])
+    tag    = "📄 Demo" if PAPER_MODE else "💸 Live"
+    pnl_u  = s.get("pnl_usdt", 0)
+    sign_p = "+" if s["pnl_pct"] >= 0 else ""
+    sign_u = "+" if pnl_u >= 0 else ""
+    # escape all floats — unescaped "." breaks MarkdownV2
+    bal    = escape(fmt_num(s["balance"]))
+    start  = escape(fmt_num(s["start_balance"]))
+    peak   = escape(fmt_num(s["peak"]))
+    pct    = escape(f"{sign_p}{s['pnl_pct']}%")
+    usdt   = escape(f"{sign_u}{pnl_u} USDT")
+    dd     = escape(f"{s['drawdown']}%")
+    wr     = escape(f"{s['wr']}%")
+    lines  = [
+        f"{ep} *{escape(tag)}*",
+        "",
+        f"💰 Balance: *{bal}*  \\(start: {start}\\)",
+        f"📈 P&L: *{pct}*  \\({usdt}\\)",
+        f"🏔 Peak: *{peak}*",
+        f"📉 Drawdown: *{dd}*",
+        f"🎯 Win Rate: *{wr}*",
+        f"📊 Trades: *{s['total']}*  \\({s['wins']}W / {s['losses']}L\\)",
+    ]
+    if s["cons_win"] > 1:
+        lines.append(f"🔥 Streak: *{s['cons_win']}W* winning")
+    elif s["cons_loss"] > 1:
+        lines.append(f"❄️ Streak: *{s['cons_loss']}L* losing")
+    return "\n".join(lines)
 
 
 def fmt_astro(a) -> str:
@@ -193,16 +206,16 @@ def fmt_live_trade(lt: LiveTradeState, btc: float) -> str:
     dist_tp = round(abs(btc - lt.target) / lt.entry * 100, 2)
     dist_sl = round(abs(btc - lt.stop) / lt.entry * 100, 2)
     return "\n".join([
-        f"⚡ *Open Trade — {mode}*",
+        f"⚡ *Open Trade — {escape(mode)}*",
         f"",
         f"{d} — {escape(lt.pattern)}",
         f"",
-        f"📥 *Entry:*  {fmt_num(lt.entry)}",
-        f"₿ *Now:*   {fmt_num(btc)}",
-        f"🎯 *Target:* {fmt_num(lt.target)} \\({dist_tp}% away\\)",
-        f"🛑 *Stop:*   {fmt_num(lt.stop)} \\({dist_sl}% away\\)",
-        f"💼 *Size:*   {fmt_num(lt.size_usdt)}",
-        f"⏱ *Open:*  {dur}m",
+        f"📥 *Entry:*  {escape(fmt_num(lt.entry))}",
+        f"₿ *Now:*   {escape(fmt_num(btc))}",
+        f"🎯 *Target:* {escape(fmt_num(lt.target))} \\({escape(str(dist_tp))}% away\\)",
+        f"🛑 *Stop:*   {escape(fmt_num(lt.stop))} \\({escape(str(dist_sl))}% away\\)",
+        f"💼 *Size:*   {escape(fmt_num(lt.size_usdt))}",
+        f"⏱ *Open:*  {escape(str(dur))}m",
     ])
 
 
@@ -216,13 +229,13 @@ def fmt_trade_close(ev: dict) -> str:
         f"",
         f"{'🟢' if ev['direction']=='LONG' else '🔴'} {escape(ev['direction'])} — {escape(ev['pattern'])}",
         f"",
-        f"📥 Entry:    {fmt_num(ev['entry'])}",
-        f"📤 Exit:     {fmt_num(ev['exit'])}",
+        f"📥 Entry:    {escape(fmt_num(ev['entry']))}",
+        f"📤 Exit:     {escape(fmt_num(ev['exit']))}",
         f"💰 P&L:      *{pnl}*  \\({usdt}\\)",
         f"⏱ Duration: {ev['duration']}m",
     ]
     if ev.get("demo_balance") is not None:
-        lines.append(f"💼 Demo wallet: *{fmt_num(ev['demo_balance'])}*")
+        lines.append(f"💼 Demo wallet: *{escape(fmt_num(ev['demo_balance']))}*")
     return "\n".join(lines)
 
 
@@ -239,10 +252,10 @@ def fmt_daily(summary: dict) -> str:
         f"📋 *PLATINIUM Daily Summary*",
         f"_{escape(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))}_",
         f"",
-        f"💰 *Balance:* {fmt_num(s['balance'])} \\({'+' if s['pnl_pct']>=0 else ''}{s['pnl_pct']}%\\)",
-        f"🏔 *Peak:* {fmt_num(s['peak'])}",
-        f"📉 *Max DD:* {s['drawdown']}%",
-        f"🎯 *Win Rate:* {s['wr']}% \\({s['wins']}W/{s['losses']}L\\)",
+        f"💰 *Balance:* {escape(fmt_num(s['balance']))} \\({escape(('+' if s['pnl_pct']>=0 else '')+str(s['pnl_pct'])+'%')}\\)",
+        f"🏔 *Peak:* {escape(fmt_num(s['peak']))}",
+        f"📉 *Max DD:* {escape(str(s['drawdown'])+'%')}",
+        f"🎯 *Win Rate:* {escape(str(s['wr'])+'%')} \\({s['wins']}W/{s['losses']}L\\)",
         f"📊 *Trades:* {s['total']}",
         f"",
         f"🔬 *Edge Score:* {s['edge_score']}/100 — {escape(s['edge_status'])}",
@@ -253,7 +266,7 @@ def fmt_daily(summary: dict) -> str:
         f"",
         f"{a.moon_emoji} *{escape(a.moon_phase)}*",
         f"☿ Mercury: {'⚠️ RETROGRADE' if a.merc_rx else '✅ DIRECT'}",
-        f"₿ BTC: {fmt_num(s['btc'])} \\({'+' if s['btc_chg']>=0 else ''}{s['btc_chg']}%\\)",
+        f"₿ BTC: {escape(fmt_num(s['btc']))} \\({escape(('+' if s['btc_chg']>=0 else '')+str(s['btc_chg'])+'%')}\\)",
     ])
 
 
@@ -401,8 +414,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "",
         f"⏱ Uptime: *{h}h {m}m*",
         f"🎯 Tick count: *{engine.tick_count}*",
-        f"💰 Sim Balance: *{fmt_num(s['balance'])}*",
-        f"₿ BTC: *{fmt_num(s['btc'])}* \\({'+' if s['btc_chg']>=0 else ''}{s['btc_chg']}%\\)",
+        f"💰 Sim Balance: *{escape(fmt_num(s['balance']))}*",
+        f"₿ BTC: *{escape(fmt_num(s['btc']))}* \\({escape(('+' if s['btc_chg']>=0 else '')+str(s['btc_chg'])+'%')}\\)",
         f"📦 DB: *{s['db_size']}/{len(PATTERNS)} patterns*",
         f"🔬 Edge: *{s['edge_score']} — {escape(s['edge_status'])}*",
         f"📡 Live price: *{'✅' if engine.live_price.fresh else '⚠️ simulated'}*",
@@ -424,7 +437,7 @@ async def cmd_settrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
     if not args:
         await update.message.reply_text(
-            f"💼 *Current trade size: {fmt_num(TRADE_CAPITAL_USDT)}*\n\n"
+            f"💼 *Current trade size: {escape(fmt_num(TRADE_CAPITAL_USDT))}*\n\n"
             f"Usage: `/settrade 5` to set \\$5 per trade",
             parse_mode=ParseMode.MARKDOWN_V2)
         return
@@ -436,7 +449,7 @@ async def cmd_settrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         engine.trade_size_usdt = val
         log.info(f"Trade capital set to ${val} by user {user_id}")
         await update.message.reply_text(
-            f"✅ *Trade size set to {fmt_num(TRADE_CAPITAL_USDT)} per trade*",
+            f"✅ *Trade size set to {escape(fmt_num(TRADE_CAPITAL_USDT))} per trade*",
             parse_mode=ParseMode.MARKDOWN_V2)
     except ValueError:
         await update.message.reply_text("❌ Invalid amount\\. Example: `/settrade 5`",
@@ -452,7 +465,7 @@ async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📭 *No open trade right now*\n\n"
             f"Mode: *{escape(mode)}*\n"
             f"Bitget: *{escape(bitget_ok)}*\n"
-            f"Capital per trade: *{fmt_num(TRADE_CAPITAL_USDT)}*",
+            f"Capital per trade: *{escape(fmt_num(TRADE_CAPITAL_USDT))}*",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=main_keyboard())
         return
@@ -471,14 +484,25 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     async def edit(text: str, keyboard=None):
         """Edit the existing message in-place — no new message spam."""
+        kb = keyboard if keyboard is not None else main_keyboard()
         try:
             await query.message.edit_text(
                 text,
                 parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=keyboard if keyboard is not None else main_keyboard(),
+                reply_markup=kb,
             )
-        except Exception:
-            pass  # "message is not modified" — silently ignore
+        except Exception as exc:
+            err = str(exc)
+            if "message is not modified" in err:
+                return  # identical content — silently ignore
+            # Real error (e.g. parse error, flood limit) — log it and send plain text fallback
+            log.error(f"edit_text failed [{data}]: {exc}")
+            try:
+                # Strip markdown and send as plain text so user sees something
+                plain = text.replace("*", "").replace("_", "").replace("\\", "").replace("`", "")
+                await query.message.edit_text(plain, reply_markup=kb)
+            except Exception:
+                pass  # if even plain text fails, nothing we can do
 
     if data == "signal":
         sig = engine.get_signal()
@@ -498,7 +522,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"📭 *No open trade*\n\n"
                 f"Mode: *{escape(mode)}*\n"
                 f"Bitget: *{escape(bitget)}*\n"
-                f"Size per trade: *{fmt_num(TRADE_CAPITAL_USDT)}*"
+                f"Size per trade: *{escape(fmt_num(TRADE_CAPITAL_USDT))}*"
             )
 
     elif data == "equity":
@@ -527,8 +551,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "",
             f"⏱ Uptime: *{h}h {m}m*",
             f"🎯 Ticks: *{engine.tick_count}*",
-            f"💰 Wallet: *{fmt_num(s['balance'])}*",
-            f"₿ BTC: *{fmt_num(s['btc'])}* \\({'+' if s['btc_chg']>=0 else ''}{s['btc_chg']}%\\)",
+            f"💰 Wallet: *{escape(fmt_num(s['balance']))}*",
+            f"₿ BTC: *{escape(fmt_num(s['btc']))}* \\({escape(('+' if s['btc_chg']>=0 else '')+str(s['btc_chg'])+'%')}\\)",
             f"📦 DB: *{s['db_size']}/{len(PATTERNS)} patterns*",
             f"🔬 Edge: *{s['edge_score']} — {escape(s['edge_status'])}*",
             f"📡 Price feed: *{'✅ live' if engine.live_price.fresh else '⚠️ simulated'}*",
