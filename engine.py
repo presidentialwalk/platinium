@@ -168,79 +168,6 @@ async def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int
 
 
 # ═══════════════════════════════════════════════
-# POLYMARKET ENGINE
-# ═══════════════════════════════════════════════
-
-POLYMARKET_API = "https://gamma-api.polymarket.com/markets"
-POLY_KEYWORDS_BULL = ["above", "reach", "hit", "exceed", "over", "higher", "bull", "surpass"]
-POLY_KEYWORDS_BEAR = ["below", "drop", "crash", "fall", "bear", "under", "lose"]
-
-
-@dataclass
-class PolymarketState:
-    bull_pct: float = 50.0
-    markets: list = field(default_factory=list)  # [{question, yes_pct, volume}]
-    fresh: bool = False
-    last_fetch: float = 0.0
-
-
-async def fetch_polymarket(session: Optional[aiohttp.ClientSession] = None) -> PolymarketState:
-    """Fetch BTC/crypto prediction markets from Polymarket Gamma API."""
-    url = POLYMARKET_API + "?search=bitcoin&active=true&closed=false&limit=10"
-    close_session = False
-    try:
-        if session is None:
-            session = aiohttp.ClientSession()
-            close_session = True
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            data = await resp.json()
-        if close_session:
-            await session.close()
-            close_session = False
-
-        markets = []
-        bull_scores = []
-
-        for m in data:
-            if not m.get("active") or m.get("closed"):
-                continue
-            try:
-                prices = json.loads(m.get("outcomePrices", "[]"))
-                if len(prices) < 2:
-                    continue
-                yes_pct = round(float(prices[0]) * 100, 1)
-                vol = float(m.get("volume", 0))
-                q = m.get("question", "")
-                markets.append({"question": q[:70], "yes_pct": yes_pct, "volume": vol})
-                q_lower = q.lower()
-                if any(w in q_lower for w in POLY_KEYWORDS_BEAR):
-                    bull_scores.append((100 - yes_pct, vol))
-                else:
-                    bull_scores.append((yes_pct, vol))
-            except Exception:
-                continue
-
-        if not bull_scores:
-            return PolymarketState()
-
-        total_vol = sum(v for _, v in bull_scores) or 1.0
-        bull_pct = round(sum(p * v for p, v in bull_scores) / total_vol, 1)
-        return PolymarketState(
-            bull_pct=bull_pct,
-            markets=markets[:5],
-            fresh=True,
-            last_fetch=time.time(),
-        )
-    except Exception:
-        if close_session and session:
-            try:
-                await session.close()
-            except Exception:
-                pass
-        return PolymarketState()
-
-
-# ═══════════════════════════════════════════════
 # INDICATOR ENGINE
 # ═══════════════════════════════════════════════
 
@@ -281,10 +208,9 @@ class Readings:
     chain_flow: float
     whale_buy: bool
     range_pos: float
-    poly_bull: float = 50.0
 
 
-def get_readings(ph: list, lp: LivePrice, poly_bull: float = 50.0) -> Readings:
+def get_readings(ph: list, lp: LivePrice) -> Readings:
     c = ph
     if len(c) < 3:
         c = [lp.btc] * 30
@@ -364,7 +290,6 @@ def get_readings(ph: list, lp: LivePrice, poly_bull: float = 50.0) -> Readings:
         rsi_rising=rsi > 48,
         macd_cross=abs(macd) < 0.001 and macd != 0,
         funding=funding, chain_flow=chain_flow, whale_buy=whale_buy, range_pos=range_pos,
-        poly_bull=poly_bull,
     )
 
 
@@ -447,10 +372,6 @@ PATTERNS = [
     # MACRO
     _p("fear",       "Extreme Fear",          "MACRO",   1,   0.63, ["MACRO"],         lambda r,a: r.rsi < 28 and r.vol_r > 1.5),
     _p("gamma_sq",   "Gamma Squeeze",         "MACRO",   1,   0.64, ["MACRO","VOL"],   lambda r,a: r.vol_r > 2.5 and r.funding < -0.01 and r.rsi < 45),
-    # POLYMARKET
-    _p("poly_bull",  "Polymarket Bullish",    "MACRO",   1,   0.64, ["MACRO"],         lambda r,a: r.poly_bull > 60),
-    _p("poly_bear",  "Polymarket Bearish",    "MACRO",  -1,   0.63, ["MACRO"],         lambda r,a: r.poly_bull < 40),
-    _p("poly_combo", "Poly Bull + Oversold",  "COMBO",   1,   0.69, ["MACRO","RSI"],   lambda r,a: r.poly_bull > 62 and r.rsi < 38),
 ]
 
 
@@ -868,17 +789,9 @@ class PlatiniumEngine:
         self.db = Database()
         self.sim = SimState(start_balance=demo_balance)
         self.tick_count = 0
-        self.polymarket = PolymarketState()
         self.executor = executor or BitgetExecutor()
         self.live_trade = LiveTradeState()
         self.trade_size_usdt = trade_size_usdt
-
-    async def update_polymarket(self, session: aiohttp.ClientSession):
-        """Fetch fresh Polymarket sentiment."""
-        self.polymarket = await fetch_polymarket(session)
-
-    def get_polymarket(self) -> PolymarketState:
-        return self.polymarket
 
     def get_live_trade(self) -> LiveTradeState:
         return self.live_trade
@@ -993,7 +906,7 @@ class PlatiniumEngine:
         self.price_history.tick(self.live_price.btc)
 
         a = get_astro()
-        r = get_readings(self.price_history.closes, self.live_price, self.polymarket.bull_pct)
+        r = get_readings(self.price_history.closes, self.live_price)
 
         rec = self.db.find_best(r, a)
         trade = None
@@ -1005,7 +918,7 @@ class PlatiniumEngine:
     def get_signal(self) -> Optional[dict]:
         """Get the current best signal without executing a trade."""
         a = get_astro()
-        r = get_readings(self.price_history.closes, self.live_price, self.polymarket.bull_pct)
+        r = get_readings(self.price_history.closes, self.live_price)
         rec = self.db.find_best(r, a)
         if not rec:
             return None
@@ -1033,8 +946,6 @@ class PlatiniumEngine:
         if r.wick_dn:    why.append("Wick rejection — liquidity grab")
         if r.vol_r > 1.8:why.append(f"Volume {r.vol_r:.1f}× — conviction move")
         if r.funding < -0.025: why.append(f"Funding {r.funding:.3f}% — squeeze building")
-        if self.polymarket.fresh and r.poly_bull > 62: why.append(f"Polymarket crowd {r.poly_bull}% bull")
-        if self.polymarket.fresh and r.poly_bull < 38: why.append(f"Polymarket crowd {r.poly_bull}% bull — bearish")
 
         return {
             "pattern":    pat.name,

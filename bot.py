@@ -21,7 +21,7 @@ from telegram.constants import ParseMode
 
 from engine import (
     PlatiniumEngine, fetch_price, fetch_klines, get_astro,
-    get_readings, PATTERNS, calc_edge, LivePrice, PolymarketState,
+    get_readings, PATTERNS, calc_edge, LivePrice,
     BitgetExecutor, LiveTradeState
 )
 
@@ -45,10 +45,9 @@ EDGE_ALERT_LEVELS = [50, 70, 85]                             # alert when edge c
 EQUITY_ALERT_PCT  = float(os.getenv("EQUITY_ALERT_PCT", "5"))# alert every X% balance change
 
 # Intervals (seconds)
-TICK_INTERVAL        = int(os.getenv("TICK_INTERVAL", "30"))       # engine tick every 30s
-PRICE_INTERVAL       = int(os.getenv("PRICE_INTERVAL", "15"))      # price fetch every 15s
-POLYMARKET_INTERVAL  = int(os.getenv("POLYMARKET_INTERVAL", "300"))# polymarket fetch every 5m
-DAILY_HOUR           = int(os.getenv("DAILY_HOUR", "8"))           # daily summary at 08:00 UTC
+TICK_INTERVAL  = int(os.getenv("TICK_INTERVAL", "30"))   # engine tick every 30s
+PRICE_INTERVAL = int(os.getenv("PRICE_INTERVAL", "15"))  # price fetch every 15s
+DAILY_HOUR     = int(os.getenv("DAILY_HOUR", "8"))        # daily summary at 08:00 UTC
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -123,8 +122,7 @@ def fmt_signal(sig: dict, lp_btc: float) -> str:
         f"🛑 *Stop Loss:* {fmt_num(sig['stop'])}",
         f"🎯 *Target:* {fmt_num(sig['target'])}",
         f"⚖️ *R:R:* {sig['rr']}:1",
-        f"🔢 *Leverage:* {sig['lev']}×",
-        f"💼 *Size:* {sig['size_pct']}% of balance",
+        f"🔢 *Leverage:* {sig['leverage']}×",
     ]
     if sig.get("why"):
         lines += ["", "🧠 *Why:*"]
@@ -188,34 +186,6 @@ def fmt_astro(a) -> str:
     ])
 
 
-def fmt_polymarket(pm: PolymarketState) -> str:
-    if pm.bull_pct > 60:
-        crowd = "🟢 BULLISH"
-    elif pm.bull_pct < 40:
-        crowd = "🔴 BEARISH"
-    else:
-        crowd = "🟡 NEUTRAL"
-    bar_filled = round(pm.bull_pct / 10)
-    bar = "█" * bar_filled + "░" * (10 - bar_filled)
-    lines = [
-        "📊 *Polymarket — Crypto Crowd Sentiment*",
-        "",
-        f"`{bar}` {pm.bull_pct}% Bull",
-        f"*Crowd: {escape(crowd)}*",
-        "",
-        "*Active Markets:*",
-    ]
-    for m in pm.markets:
-        e = "🟢" if m["yes_pct"] > 55 else "🔴" if m["yes_pct"] < 45 else "🟡"
-        q = escape(m["question"][:55])
-        lines.append(f"{e} {q} — *{m['yes_pct']}%*")
-    if not pm.markets:
-        lines.append("_No data yet — fetching every 5 min_")
-    if not pm.fresh:
-        lines += ["", "⚠️ _Not yet fetched — check back soon_"]
-    return "\n".join(lines)
-
-
 def fmt_live_trade(lt: LiveTradeState, btc: float) -> str:
     mode = "📄 PAPER" if lt.paper else "💸 LIVE"
     d = "🟢 LONG" if lt.direction == 1 else "🔴 SHORT"
@@ -276,7 +246,7 @@ def fmt_daily(summary: dict) -> str:
         f"📊 *Trades:* {s['total']}",
         f"",
         f"🔬 *Edge Score:* {s['edge_score']}/100 — {escape(s['edge_status'])}",
-        f"📦 *DB Patterns:* {s['db_size']}/41",
+        f"📦 *DB Patterns:* {s['db_size']}/{len(PATTERNS)}",
         f"🏆 *Elite Patterns:* {s['elite']}",
         f"",
         f"🏅 *Best Pattern:* {escape(top_pat.pattern.name) if top_pat else '—'} \\({best_acc}% acc\\)",
@@ -291,14 +261,14 @@ def fmt_daily(summary: dict) -> str:
 
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Signal", callback_data="signal"),
-         InlineKeyboardButton("🔬 Edge",   callback_data="edge")],
-        [InlineKeyboardButton("💰 Equity", callback_data="equity"),
-         InlineKeyboardButton("🌌 Astro",  callback_data="astro")],
-        [InlineKeyboardButton("🔍 Search Coin", callback_data="search_prompt"),
-         InlineKeyboardButton("📋 Summary",     callback_data="summary")],
-        [InlineKeyboardButton("📊 Polymarket",  callback_data="polymarket"),
-         InlineKeyboardButton("⚡ Trades",      callback_data="trades")],
+        [InlineKeyboardButton("📡 Signal",  callback_data="signal"),
+         InlineKeyboardButton("⚡ Trades",  callback_data="trades")],
+        [InlineKeyboardButton("💰 Wallet",  callback_data="equity"),
+         InlineKeyboardButton("🔬 Edge",    callback_data="edge")],
+        [InlineKeyboardButton("🔍 Search",  callback_data="search_prompt"),
+         InlineKeyboardButton("🌌 Astro",   callback_data="astro")],
+        [InlineKeyboardButton("📋 Summary", callback_data="summary"),
+         InlineKeyboardButton("⚙️ Status",  callback_data="status")],
     ])
 
 
@@ -319,7 +289,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = "\n".join([
         "🔱 *PLATINIUM* — Live Trading Intelligence",
         "",
-        "The lens is running\\. I scan 41 patterns across:",
+        f"The lens is running\\. I scan {len(PATTERNS)} patterns across:",
         "candlesticks, price action, Wyckoff, on\\-chain,",
         "Fibonacci, Elliott, astrology, and macro\\.",
         "",
@@ -339,17 +309,19 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = "\n".join([
         "🔱 *PLATINIUM Commands*",
         "",
-        "/start — Start bot \\+ subscribe to alerts",
-        "/signal — Current best signal",
-        "/edge — Edge score and database stats",
-        "/equity — Simulation P\\&L",
-        "/astro — Current astro conditions",
-        "/summary — Full daily summary",
-        "/search — Analyze any coin",
-        "/stop — Unsubscribe from alerts",
-        "/status — Bot health check",
+        "/signal — Best signal right now",
+        "/trades — Open trade status",
+        "/equity — Demo wallet P&L",
+        "/edge — Pattern learning stats",
+        "/astro — Moon \\& Mercury conditions",
+        "/search — Scan any coin",
+        "/summary — Full daily report",
+        "/status — Bot health",
+        "/settrade — Set \\$ per trade",
+        "/start — Subscribe to alerts",
+        "/stop — Unsubscribe",
         "",
-        "Or use the inline keyboard buttons\\.",
+        "Or use the buttons below\\.",
     ])
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN_V2,
                                      reply_markup=main_keyboard())
@@ -431,7 +403,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🎯 Tick count: *{engine.tick_count}*",
         f"💰 Sim Balance: *{fmt_num(s['balance'])}*",
         f"₿ BTC: *{fmt_num(s['btc'])}* \\({'+' if s['btc_chg']>=0 else ''}{s['btc_chg']}%\\)",
-        f"📦 DB: *{s['db_size']}/44 patterns*",
+        f"📦 DB: *{s['db_size']}/{len(PATTERNS)} patterns*",
         f"🔬 Edge: *{s['edge_score']} — {escape(s['edge_status'])}*",
         f"📡 Live price: *{'✅' if engine.live_price.fresh else '⚠️ simulated'}*",
         f"👥 Subscribers: *{len(subscribed_chats)}*",
@@ -441,13 +413,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bitget_line,
     ])
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN_V2)
-
-
-async def cmd_polymarket(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pm = engine.get_polymarket()
-    await update.message.reply_text(
-        fmt_polymarket(pm), parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=main_keyboard())
 
 
 async def cmd_settrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -502,59 +467,84 @@ async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
+    data  = query.data
 
-    reply = query.message.reply_text
+    async def edit(text: str, keyboard=None):
+        """Edit the existing message in-place — no new message spam."""
+        try:
+            await query.message.edit_text(
+                text,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard if keyboard is not None else main_keyboard(),
+            )
+        except Exception:
+            pass  # "message is not modified" — silently ignore
 
     if data == "signal":
         sig = engine.get_signal()
         if not sig:
-            await reply("🔵 *No signal right now*\n\nLens is scanning\\. Wait for confidence\\.",
-                        parse_mode=ParseMode.MARKDOWN_V2)
+            await edit("🔵 *Scanning\\.\\.\\.*\n\nNo high\\-confidence pattern right now\\.\nCheck back soon\\.")
         else:
-            await reply(fmt_signal(sig, engine.live_price.btc),
-                        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
-
-    elif data == "edge":
-        await reply(fmt_edge(engine.get_edge()),
-                    parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
-
-    elif data == "equity":
-        await reply(fmt_equity(engine.get_summary()),
-                    parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
-
-    elif data == "astro":
-        await reply(fmt_astro(engine.get_astro()),
-                    parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
-
-    elif data == "summary":
-        await reply(fmt_daily(engine.get_summary()),
-                    parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
-
-    elif data == "search_prompt":
-        await reply("🔍 *Quick coin scan — tap one:*",
-                    parse_mode=ParseMode.MARKDOWN_V2, reply_markup=coin_keyboard())
-
-    elif data == "polymarket":
-        await reply(fmt_polymarket(engine.get_polymarket()),
-                    parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
+            await edit(fmt_signal(sig, engine.live_price.btc))
 
     elif data == "trades":
         lt = engine.get_live_trade()
         if lt.active:
-            await reply(fmt_live_trade(lt, engine.live_price.btc),
-                        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
+            await edit(fmt_live_trade(lt, engine.live_price.btc))
         else:
-            await reply("📭 *No open trade right now*",
-                        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
+            mode    = "PAPER" if PAPER_MODE else "LIVE"
+            bitget  = "✅ Connected" if _executor.enabled else "⚠️ Keys not set"
+            await edit(
+                f"📭 *No open trade*\n\n"
+                f"Mode: *{escape(mode)}*\n"
+                f"Bitget: *{escape(bitget)}*\n"
+                f"Size per trade: *{fmt_num(TRADE_CAPITAL_USDT)}*"
+            )
+
+    elif data == "equity":
+        await edit(fmt_equity(engine.get_summary()))
+
+    elif data == "edge":
+        await edit(fmt_edge(engine.get_edge()))
+
+    elif data == "search_prompt":
+        await edit("🔍 *Tap a coin to scan:*", keyboard=coin_keyboard())
+
+    elif data == "astro":
+        await edit(fmt_astro(engine.get_astro()))
+
+    elif data == "summary":
+        await edit(fmt_daily(engine.get_summary()))
+
+    elif data == "status":
+        uptime = time.time() - start_time
+        h = int(uptime // 3600)
+        m = int((uptime % 3600) // 60)
+        s = engine.get_summary()
+        lt = engine.get_live_trade()
+        await edit("\n".join([
+            "⚙️ *PLATINIUM Status*",
+            "",
+            f"⏱ Uptime: *{h}h {m}m*",
+            f"🎯 Ticks: *{engine.tick_count}*",
+            f"💰 Wallet: *{fmt_num(s['balance'])}*",
+            f"₿ BTC: *{fmt_num(s['btc'])}* \\({'+' if s['btc_chg']>=0 else ''}{s['btc_chg']}%\\)",
+            f"📦 DB: *{s['db_size']}/{len(PATTERNS)} patterns*",
+            f"🔬 Edge: *{s['edge_score']} — {escape(s['edge_status'])}*",
+            f"📡 Price feed: *{'✅ live' if engine.live_price.fresh else '⚠️ simulated'}*",
+            f"👥 Subscribers: *{len(subscribed_chats)}*",
+            "",
+            f"⚡ Trade: *{('OPEN — ' + escape(lt.pattern)) if lt.active else 'none'}*",
+            f"💸 Mode: *{'PAPER' if PAPER_MODE else 'LIVE'}*",
+            f"🔑 Bitget: *{'✅' if _executor.enabled else '⚠️ keys not set'}*",
+        ]))
 
     elif data == "back":
-        await reply("🔱 *PLATINIUM*\n\nWhat do you need?",
-                    parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_keyboard())
+        await edit("🔱 *PLATINIUM* — What do you need?")
 
     elif data.startswith("coin_"):
         _, sym, name = data.split("_", 2)
-        await do_coin_search(reply, sym, name)
+        await do_coin_search(query.message.reply_text, sym, name)
 
 
 # ── COIN SEARCH ──────────────────────────────────────────────────
@@ -672,7 +662,6 @@ async def engine_loop(app: Application):
     log.info("Engine loop started")
 
     price_tick = 0
-    polymarket_tick = 0
 
     while True:
         try:
@@ -681,13 +670,6 @@ async def engine_loop(app: Application):
             if price_tick >= PRICE_INTERVAL:
                 await engine.update_price(session)
                 price_tick = 0
-
-            # Fetch Polymarket sentiment every POLYMARKET_INTERVAL seconds
-            polymarket_tick += TICK_INTERVAL
-            if polymarket_tick >= POLYMARKET_INTERVAL:
-                await engine.update_polymarket(session)
-                log.info(f"Polymarket updated: {engine.polymarket.bull_pct}% bull, {len(engine.polymarket.markets)} markets")
-                polymarket_tick = 0
 
             # ── CHECK OPEN TRADE ──────────────────────
             close_ev = await engine.check_and_close_live_trade(session)
@@ -831,11 +813,10 @@ def main():
     app.add_handler(CommandHandler("astro",   cmd_astro))
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("search",  cmd_search))
-    app.add_handler(CommandHandler("stop",       cmd_stop))
-    app.add_handler(CommandHandler("status",     cmd_status))
-    app.add_handler(CommandHandler("polymarket", cmd_polymarket))
-    app.add_handler(CommandHandler("trades",     cmd_trades))
-    app.add_handler(CommandHandler("settrade",   cmd_settrade))
+    app.add_handler(CommandHandler("stop",     cmd_stop))
+    app.add_handler(CommandHandler("status",   cmd_status))
+    app.add_handler(CommandHandler("trades",   cmd_trades))
+    app.add_handler(CommandHandler("settrade", cmd_settrade))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))
