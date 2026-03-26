@@ -35,7 +35,7 @@ BITGET_API_KEY    = os.getenv("BITGET_API_KEY", "")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
 BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
 PAPER_MODE        = os.getenv("PAPER_MODE", "true").lower() != "false"
-TRADE_CAPITAL_USDT = float(os.getenv("TRADE_CAPITAL_USDT", "50"))
+TRADE_CAPITAL_USDT = float(os.getenv("TRADE_CAPITAL_USDT", "1"))  # editable via /settrade
 
 # Alert thresholds
 SIGNAL_MIN_CONF   = int(os.getenv("MIN_CONFIDENCE", "62"))   # minimum confidence to alert
@@ -439,6 +439,33 @@ async def cmd_polymarket(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_keyboard())
 
 
+async def cmd_settrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global TRADE_CAPITAL_USDT
+    user_id = update.effective_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    args = ctx.args
+    if not args:
+        await update.message.reply_text(
+            f"💼 *Current trade size: {fmt_num(TRADE_CAPITAL_USDT)}*\n\n"
+            f"Usage: `/settrade 5` to set \\$5 per trade",
+            parse_mode=ParseMode.MARKDOWN_V2)
+        return
+    try:
+        val = float(args[0])
+        if val <= 0:
+            raise ValueError
+        TRADE_CAPITAL_USDT = val
+        log.info(f"Trade capital set to ${val} by user {user_id}")
+        await update.message.reply_text(
+            f"✅ *Trade size set to {fmt_num(TRADE_CAPITAL_USDT)} per trade*",
+            parse_mode=ParseMode.MARKDOWN_V2)
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount\\. Example: `/settrade 5`",
+                                        parse_mode=ParseMode.MARKDOWN_V2)
+
+
 async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lt = engine.get_live_trade()
     if not lt.active:
@@ -668,9 +695,9 @@ async def engine_loop(app: Application):
                     await broadcast(app, fmt_signal(sig, engine.live_price.btc))
                     # Open live / paper trade
                     if not engine.live_trade.active:
-                        lt = await engine.open_live_trade(session, sig)
+                        lt = await engine.open_live_trade(session, sig, TRADE_CAPITAL_USDT)
                         mode = "PAPER" if lt.paper else "LIVE"
-                        log.info(f"Trade opened [{mode}]: {lt.pattern} order={lt.order_id}")
+                        log.info(f"Trade opened [{mode}] ${TRADE_CAPITAL_USDT}: {lt.pattern} order={lt.order_id}")
             elif not sig:
                 last_signal_id = None
 
@@ -796,6 +823,7 @@ def main():
     app.add_handler(CommandHandler("status",     cmd_status))
     app.add_handler(CommandHandler("polymarket", cmd_polymarket))
     app.add_handler(CommandHandler("trades",     cmd_trades))
+    app.add_handler(CommandHandler("settrade",   cmd_settrade))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))

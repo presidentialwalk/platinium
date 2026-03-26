@@ -874,13 +874,10 @@ class PlatiniumEngine:
         return self.live_trade
 
     async def open_live_trade(self, session: aiohttp.ClientSession,
-                               sig: dict) -> LiveTradeState:
+                               sig: dict, size_usdt: float = 1.0) -> LiveTradeState:
         """Open a real or paper trade from a signal dict."""
         if self.live_trade.active:
             return self.live_trade
-        size_usdt = self.executor.paper and 100.0 or max(
-            10.0, self.sim.balance * 0.10
-        )
         direction = 1 if sig["direction"] == "LONG" else -1
         result = await self.executor.place_order(
             session, direction,
