@@ -37,64 +37,70 @@ class OnChainCache:
     updated_at: float = 0.0
     fresh:      bool  = False  # True once real data has been fetched
 
-_onchain = OnChainCache()
+_onchain: dict = {}   # symbol -> OnChainCache (populated per-coin)
 
 
-async def update_onchain(session: aiohttp.ClientSession) -> OnChainCache:
+async def update_onchain(session: aiohttp.ClientSession,
+                         symbol: str = "BTCUSDT") -> OnChainCache:
     """
-    Fetch real BTC on-chain/derivatives data from Binance Futures public API.
-    Falls back to price-derived estimates if any endpoint fails.
-    Updates the module-level _onchain cache and returns it.
+    Fetch real on-chain/derivatives data for a single symbol from Binance Futures.
+    Updates _onchain[symbol] and returns it.
     """
     global _onchain
+    prev = _onchain.get(symbol, OnChainCache())
 
-    funding    = _onchain.funding
-    chain_flow = _onchain.chain_flow
-    whale_buy  = _onchain.whale_buy
+    funding    = prev.funding
+    chain_flow = prev.chain_flow
+    whale_buy  = prev.whale_buy
+
+    perp = symbol  # Binance futures symbol is the same (BTCUSDT, ETHUSDT …)
 
     # ── 1. FUNDING RATE ───────────────────────────────────────────
     try:
-        url = "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT"
+        url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={perp}"
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
             data = await r.json()
         funding = round(float(data["lastFundingRate"]) * 100, 5)
     except Exception as e:
-        log.debug(f"OnChain funding fetch failed: {e}")
+        log.debug(f"OnChain funding {symbol} failed: {e}")
 
     # ── 2. TAKER BUY/SELL RATIO → chain_flow ─────────────────────
-    # buySellRatio > 1 = more aggressive buyers = positive flow
     try:
-        url = ("https://fapi.binance.com/futures/data/takerlongshortRatio"
-               "?symbol=BTCUSDT&period=5m&limit=3")
+        url = (f"https://fapi.binance.com/futures/data/takerlongshortRatio"
+               f"?symbol={perp}&period=5m&limit=3")
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
             data = await r.json()
         avg_ratio = sum(float(d["buySellRatio"]) for d in data) / len(data)
-        # normalize: ratio 1.0 → 0.0, 1.5 → +1.0, 0.5 → -1.0
         chain_flow = round(max(-1.0, min(1.0, (avg_ratio - 1.0) * 2.0)), 3)
     except Exception as e:
-        log.debug(f"OnChain flow fetch failed: {e}")
+        log.debug(f"OnChain flow {symbol} failed: {e}")
 
     # ── 3. GLOBAL LONG/SHORT RATIO → whale_buy ───────────────────
-    # longShortRatio > 1.15 with positive flow = whale accumulation
     try:
-        url = ("https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
-               "?symbol=BTCUSDT&period=5m&limit=1")
+        url = (f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
+               f"?symbol={perp}&period=5m&limit=1")
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
             data = await r.json()
         ls_ratio = float(data[0]["longShortRatio"])
         whale_buy = ls_ratio > 1.12 and chain_flow > 0
     except Exception as e:
-        log.debug(f"OnChain whale fetch failed: {e}")
+        log.debug(f"OnChain whale {symbol} failed: {e}")
 
-    _onchain = OnChainCache(
-        funding=funding,
-        chain_flow=chain_flow,
-        whale_buy=whale_buy,
-        updated_at=time.time(),
-        fresh=True,
+    result = OnChainCache(
+        funding=funding, chain_flow=chain_flow, whale_buy=whale_buy,
+        updated_at=time.time(), fresh=True,
     )
-    log.info(f"OnChain: funding={funding:+.4f}% flow={chain_flow:+.3f} whale={whale_buy}")
-    return _onchain
+    _onchain[symbol] = result
+    log.debug(f"OnChain {symbol}: fund={funding:+.4f}% flow={chain_flow:+.3f} whale={whale_buy}")
+    return result
+
+
+async def update_all_onchain(session: aiohttp.ClientSession,
+                              symbols: list) -> None:
+    """Batch-update on-chain data for all symbols, staggered to avoid rate limits."""
+    for sym in symbols:
+        await update_onchain(session, sym)
+        await asyncio.sleep(0.3)
 
 
 # ═══════════════════════════════════════════════
@@ -365,7 +371,8 @@ class Readings:
     range_pos: float
 
 
-def get_readings(ph: list, lp: LivePrice) -> Readings:
+def get_readings(ph: list, lp: LivePrice,
+                 onchain: Optional[OnChainCache] = None) -> Readings:
     c = ph
     if len(c) < 3:
         c = [lp.btc] * 30
@@ -423,11 +430,12 @@ def get_readings(ph: list, lp: LivePrice) -> Readings:
     else:
         vol_r = 0.6 + random.random() * 1.8
 
-    # On-chain — use cached real data if fresh (< 10 min old)
-    if _onchain.fresh and time.time() - _onchain.updated_at < 600:
-        funding    = _onchain.funding
-        chain_flow = _onchain.chain_flow
-        whale_buy  = _onchain.whale_buy
+    # On-chain — use per-coin cache if provided and fresh (< 10 min old)
+    oc = onchain or OnChainCache()
+    if oc.fresh and time.time() - oc.updated_at < 600:
+        funding    = oc.funding
+        chain_flow = oc.chain_flow
+        whale_buy  = oc.whale_buy
     else:
         # Price-derived fallback — better than pure random
         funding    = round(-0.03 if lp.chg < -1.5 else (0.03 if lp.chg > 1.5 else 0.0), 4)
@@ -841,6 +849,115 @@ class PriceHistory:
 
 
 # ═══════════════════════════════════════════════
+# MULTI-COIN SCANNER
+# ═══════════════════════════════════════════════
+
+# All symbols we scan — Binance USDT-M perps that also exist on Bitget
+SCAN_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "ADAUSDT", "NEARUSDT",
+    "DOTUSDT", "UNIUSDT", "ATOMUSDT", "LTCUSDT", "MATICUSDT",
+    "APTUSDT", "ARBUSDT", "OPUSDT", "INJUSDT", "SUIUSDT",
+]
+
+# Pretty display names
+COIN_NAMES = {
+    "BTCUSDT": "BTC",  "ETHUSDT": "ETH",  "SOLUSDT": "SOL",
+    "BNBUSDT": "BNB",  "XRPUSDT": "XRP",  "AVAXUSDT": "AVAX",
+    "DOGEUSDT": "DOGE","LINKUSDT": "LINK", "ADAUSDT": "ADA",
+    "NEARUSDT": "NEAR","DOTUSDT": "DOT",  "UNIUSDT": "UNI",
+    "ATOMUSDT": "ATOM","LTCUSDT": "LTC",  "MATICUSDT": "MATIC",
+    "APTUSDT": "APT",  "ARBUSDT": "ARB",  "OPUSDT": "OP",
+    "INJUSDT": "INJ",  "SUIUSDT": "SUI",
+}
+
+
+class CoinScanner:
+    """Tracks one coin's price, indicators, on-chain data, and pattern DB."""
+
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+        self.live_price = LivePrice()
+        self.price_history = PriceHistory()
+        self.db = Database()    # per-coin pattern learning
+
+    @property
+    def onchain(self) -> OnChainCache:
+        return _onchain.get(self.symbol, OnChainCache())
+
+    async def update_price(self, session: aiohttp.ClientSession) -> bool:
+        data = await fetch_price(self.symbol, session)
+        if data and "lastPrice" in data:
+            self.live_price.btc   = float(data["lastPrice"])
+            self.live_price.chg   = float(data["priceChangePercent"])
+            self.live_price.high  = float(data["highPrice"])
+            self.live_price.low   = float(data["lowPrice"])
+            self.live_price.vol   = float(data["volume"]) * self.live_price.btc
+            self.live_price.fresh = True
+            self.live_price.last_fetch = time.time()
+            return True
+        return False
+
+    def get_readings(self) -> Readings:
+        self.price_history.tick(self.live_price.btc)
+        return get_readings(self.price_history.closes, self.live_price, self.onchain)
+
+    def get_signal(self, sim_wins: int, sim_total: int) -> Optional[dict]:
+        """Return best signal dict for this coin, or None."""
+        a = get_astro()
+        r = get_readings(self.price_history.closes, self.live_price, self.onchain)
+        rec = self.db.find_best(r, a)
+        if not rec:
+            return None
+        pat = rec.pattern
+        price = self.live_price.btc
+
+        stop   = price * (0.97 if pat.direction == 1 else 1.03)
+        target = price * (1 + 0.04 + (rec.acc - 50) * 0.001 if pat.direction == 1
+                          else 1 - (0.04 + (rec.acc - 50) * 0.001))
+        risk   = abs(price - stop) / price
+        reward = abs(target - price) / price
+        rr     = round(reward / risk, 2) if risk > 0 else 0.0
+
+        edge = calc_edge(self.db, sim_wins, sim_total)
+        conf = min(95, max(40, round(rec.acc * 0.6 + edge.score * 0.4)))
+
+        why = []
+        if a.moon_bull and pat.direction == 1:   why.append(f"{a.moon_emoji} {a.moon_phase} — waxing bull cycle")
+        if a.moon_bear and pat.direction == -1:  why.append(f"{a.moon_emoji} {a.moon_phase} — waning bear cycle")
+        if a.merc_rx:    why.append("☿ Mercury Retrograde — reduce size 40%")
+        if r.rsi < 32:   why.append(f"RSI {r.rsi} — oversold, demand zone")
+        if r.rsi > 68:   why.append(f"RSI {r.rsi} — overbought, distribution risk")
+        if r.wick_dn:    why.append("Wick rejection — liquidity grab")
+        if r.vol_r > 1.8:why.append(f"Volume {r.vol_r:.1f}× — conviction move")
+        if r.funding < -0.025: why.append(f"Funding {r.funding:.3f}% — squeeze building")
+
+        coin = COIN_NAMES.get(self.symbol, self.symbol.replace("USDT", ""))
+        return {
+            "symbol":     self.symbol,
+            "coin":       coin,
+            "pattern":    pat.name,
+            "category":   pat.cat,
+            "direction":  "LONG" if pat.direction == 1 else "SHORT" if pat.direction == -1 else "NEUTRAL",
+            "dir_arrow":  "▲" if pat.direction == 1 else "▼",
+            "accuracy":   rec.acc,
+            "ev":         rec.ev,
+            "observations": rec.occ,
+            "confidence": conf,
+            "score":      rec.score,
+            "entry":      round(price, 6),
+            "stop":       round(stop, 6),
+            "target":     round(target, 6),
+            "rr":         rr,
+            "leverage":   get_lev(rec.acc),
+            "size_pct":   min(20, max(5, round((rec.acc - 42) / 2))),
+            "why":        why[:4],
+            "ingredients":pat.ingredients,
+            "merc_rx":    a.merc_rx,
+        }
+
+
+# ═══════════════════════════════════════════════
 # BITGET EXECUTION LAYER
 # ═══════════════════════════════════════════════
 
@@ -851,7 +968,8 @@ BITGET_BASE = "https://api.bitget.com"
 class LiveTradeState:
     active: bool = False
     order_id: str = ""
-    direction: int = 0       # 1=long, -1=short
+    symbol: str = "BTCUSDT"   # which coin this trade is on
+    direction: int = 0        # 1=long, -1=short
     entry: float = 0.0
     stop: float = 0.0
     target: float = 0.0
@@ -903,27 +1021,27 @@ class BitgetExecutor:
             return 0.0
 
     async def place_order(self, session: aiohttp.ClientSession,
-                          direction: int, size_usdt: float,
+                          symbol: str, direction: int, size_usdt: float,
                           price: float, stop: float, target: float) -> dict:
-        """Open a market order with attached TP/SL. Returns order info dict."""
+        """Open a market order with attached TP/SL on any USDT-M perp."""
         if self.paper or not self.enabled:
             return {"paper": True, "orderId": f"PAPER-{int(time.time())}"}
 
         side      = "buy"  if direction == 1 else "sell"
         hold_side = "long" if direction == 1 else "short"
-        size_btc  = round(size_usdt / price, 4)
+        size_coin = round(size_usdt / price, 6)
 
         body = json.dumps({
-            "symbol":                "BTCUSDT",
+            "symbol":                symbol,
             "productType":           "USDT-FUTURES",
             "marginMode":            "isolated",
             "marginCoin":            "USDT",
-            "size":                  str(size_btc),
+            "size":                  str(size_coin),
             "side":                  side,
             "tradeSide":             "open",
             "orderType":             "market",
-            "presetStopLossPrice":   str(round(stop, 2)),
-            "presetTakeProfitPrice": str(round(target, 2)),
+            "presetStopLossPrice":   str(round(stop, 4)),
+            "presetTakeProfitPrice": str(round(target, 4)),
         })
         path = "/api/v2/mix/order/placeOrder"
         try:
@@ -939,14 +1057,15 @@ class BitgetExecutor:
         except Exception as e:
             return {"paper": False, "orderId": "", "error": str(e)}
 
-    async def close_position(self, session: aiohttp.ClientSession, direction: int) -> dict:
-        """Close the open long or short position at market."""
+    async def close_position(self, session: aiohttp.ClientSession,
+                             symbol: str, direction: int) -> dict:
+        """Close the open position on the given symbol at market."""
         if self.paper or not self.enabled:
             return {"paper": True}
 
         hold_side = "long" if direction == 1 else "short"
         body = json.dumps({
-            "symbol":      "BTCUSDT",
+            "symbol":      symbol,
             "productType": "USDT-FUTURES",
             "holdSide":    hold_side,
         })
@@ -962,11 +1081,13 @@ class BitgetExecutor:
         except Exception as e:
             return {"error": str(e)}
 
-    async def get_position(self, session: aiohttp.ClientSession) -> dict:
-        """Return current open BTC position (empty dict if none)."""
+    async def get_position(self, session: aiohttp.ClientSession,
+                           symbol: str = "BTCUSDT") -> dict:
+        """Return current open position for a symbol (empty dict if none)."""
         if not self.enabled:
             return {}
-        path = "/api/v2/mix/position/singlePosition?symbol=BTCUSDT&productType=USDT-FUTURES&marginCoin=USDT"
+        path = (f"/api/v2/mix/position/singlePosition"
+                f"?symbol={symbol}&productType=USDT-FUTURES&marginCoin=USDT")
         try:
             async with session.get(
                 BITGET_BASE + path,
@@ -989,10 +1110,19 @@ class BitgetExecutor:
 class PlatiniumEngine:
     def __init__(self, executor: Optional[BitgetExecutor] = None,
                  trade_size_usdt: float = 1.0,
-                 demo_balance: float = 100.0):
-        self.live_price = LivePrice()
-        self.price_history = PriceHistory()
-        self.db = Database()
+                 demo_balance: float = 100.0,
+                 symbols: Optional[list] = None):
+        # ── multi-coin scanners ──
+        self.symbols = symbols or SCAN_SYMBOLS
+        self.scanners: dict[str, CoinScanner] = {
+            sym: CoinScanner(sym) for sym in self.symbols
+        }
+        # ── backward-compat aliases (BTC scanner) ──
+        btc = self.scanners["BTCUSDT"]
+        self.live_price    = btc.live_price
+        self.price_history = btc.price_history
+        self.db            = btc.db           # BTC pattern DB (primary)
+        # ── shared state ──
         self.sim = SimState(start_balance=demo_balance)
         self.tick_count = 0
         self.executor = executor or BitgetExecutor()
@@ -1003,13 +1133,13 @@ class PlatiniumEngine:
     def _save(self):
         try:
             payload = {
-                "sim": self.sim.to_dict(),
-                "db":  self.db.to_dict(),
+                "sim":  self.sim.to_dict(),
+                "dbs":  {sym: sc.db.to_dict() for sym, sc in self.scanners.items()},
             }
             tmp = DATA_FILE + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(payload, f)
-            os.replace(tmp, DATA_FILE)   # atomic write — no corrupt file on crash
+            os.replace(tmp, DATA_FILE)
         except Exception as e:
             log.warning(f"State save failed: {e}")
 
@@ -1020,8 +1150,14 @@ class PlatiniumEngine:
             with open(DATA_FILE) as f:
                 payload = json.load(f)
             self.sim.load_dict(payload.get("sim", {}))
-            self.db.load_dict(payload.get("db", {}))
-            log.info(f"State loaded from {DATA_FILE} — balance={self.sim.balance:.2f} trades={self.sim.total}")
+            # per-coin DBs (new format) or legacy single db
+            if "dbs" in payload:
+                for sym, data in payload["dbs"].items():
+                    if sym in self.scanners:
+                        self.scanners[sym].db.load_dict(data)
+            elif "db" in payload:
+                self.scanners["BTCUSDT"].db.load_dict(payload["db"])
+            log.info(f"State loaded — balance=${self.sim.balance:.2f} trades={self.sim.total} coins={len(self.scanners)}")
         except Exception as e:
             log.warning(f"State load failed (starting fresh): {e}")
 
@@ -1030,17 +1166,19 @@ class PlatiniumEngine:
 
     async def open_live_trade(self, session: aiohttp.ClientSession,
                                sig: dict, size_usdt: float = 1.0) -> LiveTradeState:
-        """Open a real or paper trade from a signal dict."""
+        """Open a real or paper trade from a signal dict (any coin)."""
         if self.live_trade.active:
             return self.live_trade
+        symbol    = sig.get("symbol", "BTCUSDT")
         direction = 1 if sig["direction"] == "LONG" else -1
         result = await self.executor.place_order(
-            session, direction,
+            session, symbol, direction,
             size_usdt, sig["entry"], sig["stop"], sig["target"]
         )
         self.live_trade = LiveTradeState(
             active=True,
             order_id=result.get("orderId", ""),
+            symbol=symbol,
             direction=direction,
             entry=sig["entry"],
             stop=sig["stop"],
@@ -1061,7 +1199,9 @@ class PlatiniumEngine:
             return None
 
         lt = self.live_trade
-        price = self.live_price.btc
+        # Use the scanner for the coin being traded
+        scanner = self.scanners.get(lt.symbol, self.scanners["BTCUSDT"])
+        price = scanner.live_price.btc
 
         if lt.paper:
             hit_tp = (lt.direction == 1 and price >= lt.target) or \
@@ -1073,7 +1213,7 @@ class PlatiniumEngine:
             win = hit_tp
             pnl_pct = ((price - lt.entry) / lt.entry * 100 * lt.direction)
         else:
-            pos = await self.executor.get_position(session)
+            pos = await self.executor.get_position(session, lt.symbol)
             if pos:
                 return None  # still open
             win = price > lt.entry if lt.direction == 1 else price < lt.entry
@@ -1100,11 +1240,14 @@ class PlatiniumEngine:
                 self.sim.cons_loss += 1
                 self.sim.cons_win = 0
 
+        coin = COIN_NAMES.get(lt.symbol, lt.symbol.replace("USDT", ""))
         event = {
+            "symbol":       lt.symbol,
+            "coin":         coin,
             "pattern":      lt.pattern,
             "direction":    "LONG" if lt.direction == 1 else "SHORT",
             "entry":        lt.entry,
-            "exit":         round(price, 2),
+            "exit":         round(price, 6),
             "pnl_pct":      round(pnl_pct, 2),
             "pnl_usdt":     pnl_usdt,
             "win":          win,
@@ -1120,93 +1263,121 @@ class PlatiniumEngine:
         return await self.executor.get_balance(session)
 
     async def refresh_onchain(self, session: aiohttp.ClientSession):
-        """Fetch real on-chain data and update the module-level cache."""
-        await update_onchain(session)
+        """Fetch on-chain data for BTC (backward compat)."""
+        await update_onchain(session, "BTCUSDT")
+
+    async def refresh_all_onchain(self, session: aiohttp.ClientSession):
+        """Fetch on-chain data for all scanned coins."""
+        await update_all_onchain(session, self.symbols)
 
     async def update_price(self, session: aiohttp.ClientSession):
-        """Fetch fresh BTC price from Binance."""
-        data = await fetch_price("BTCUSDT", session)
-        if data and "lastPrice" in data:
-            self.live_price.btc   = float(data["lastPrice"])
-            self.live_price.chg   = float(data["priceChangePercent"])
-            self.live_price.high  = float(data["highPrice"])
-            self.live_price.low   = float(data["lowPrice"])
-            self.live_price.vol   = float(data["volume"]) * self.live_price.btc
-            self.live_price.fresh = True
-            self.live_price.last_fetch = time.time()
+        """Fetch fresh BTC price (backward compat)."""
+        await self.scanners["BTCUSDT"].update_price(session)
+        # keep alias in sync
+        self.live_price = self.scanners["BTCUSDT"].live_price
+
+    async def update_all_prices(self, session: aiohttp.ClientSession):
+        """Batch-fetch prices for all scanned coins via Binance multi-ticker."""
+        syms_json = json.dumps(self.symbols)
+        url = f"https://api.binance.com/api/v3/ticker/24hr?symbols={syms_json}"
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                tickers = await r.json()
+            if isinstance(tickers, list):
+                for t in tickers:
+                    sym = t.get("symbol", "")
+                    sc  = self.scanners.get(sym)
+                    if not sc:
+                        continue
+                    sc.live_price.btc   = float(t["lastPrice"])
+                    sc.live_price.chg   = float(t["priceChangePercent"])
+                    sc.live_price.high  = float(t["highPrice"])
+                    sc.live_price.low   = float(t["lowPrice"])
+                    sc.live_price.vol   = float(t["volume"]) * sc.live_price.btc
+                    sc.live_price.fresh = True
+                    sc.live_price.last_fetch = time.time()
+                # keep BTC alias in sync
+                self.live_price = self.scanners["BTCUSDT"].live_price
+                log.debug(f"Prices updated for {len(tickers)} coins")
+                return
+        except Exception as e:
+            log.debug(f"Batch price fetch failed: {e}")
+        # fallback: update coins individually
+        for sc in self.scanners.values():
+            await sc.update_price(session)
+            await asyncio.sleep(0.1)
 
     def tick(self) -> Optional[dict]:
-        """
-        One engine tick. Returns trade dict if a trade was executed, else None.
-        """
+        """BTC-only tick (backward compat). Use tick_all() for multi-coin."""
         self.tick_count += 1
-        self.price_history.tick(self.live_price.btc)
-
+        sc = self.scanners["BTCUSDT"]
+        sc.price_history.tick(sc.live_price.btc)
         a = get_astro()
-        r = get_readings(self.price_history.closes, self.live_price)
-
-        rec = self.db.find_best(r, a)
+        r = get_readings(sc.price_history.closes, sc.live_price, sc.onchain)
+        rec = sc.db.find_best(r, a)
         trade = None
         if rec and self.sim.balance > MIN_BALANCE:
-            trade = execute_trade(self.sim, self.db, rec, r, a, self.trade_size_usdt)
+            trade = execute_trade(self.sim, sc.db, rec, r, a, self.trade_size_usdt)
             self._save()
-
         return trade
 
-    def get_signal(self) -> Optional[dict]:
-        """Get the current best signal without executing a trade."""
+    def tick_all(self) -> list:
+        """
+        Tick every coin scanner. Returns list of sim-trade dicts from all coins
+        that fired this tick. Pattern learning happens for every coin simultaneously.
+        """
+        self.tick_count += 1
+        trades = []
         a = get_astro()
-        r = get_readings(self.price_history.closes, self.live_price)
-        rec = self.db.find_best(r, a)
-        if not rec:
+        for sym, sc in self.scanners.items():
+            if not sc.live_price.fresh:
+                continue
+            sc.price_history.tick(sc.live_price.btc)
+            r = get_readings(sc.price_history.closes, sc.live_price, sc.onchain)
+            rec = sc.db.find_best(r, a)
+            if rec and self.sim.balance > MIN_BALANCE:
+                trade = execute_trade(self.sim, sc.db, rec, r, a, self.trade_size_usdt)
+                if trade:
+                    trade["symbol"] = sym
+                    trade["coin"]   = COIN_NAMES.get(sym, sym.replace("USDT", ""))
+                    trades.append(trade)
+        if trades:
+            self._save()
+        return trades
+
+    def get_signal(self) -> Optional[dict]:
+        """Best signal across all coins (highest score wins)."""
+        all_sigs = []
+        for sc in self.scanners.values():
+            if not sc.live_price.fresh:
+                continue
+            sig = sc.get_signal(self.sim.wins, self.sim.total)
+            if sig:
+                all_sigs.append(sig)
+        if not all_sigs:
             return None
-        pat = rec.pattern
-        price = self.live_price.btc
-
-        stop   = price * (0.97 if pat.direction == 1 else 1.03)
-        target = price * (1 + 0.04 + (rec.acc - 50) * 0.001 if pat.direction == 1
-                          else 1 - (0.04 + (rec.acc - 50) * 0.001))
-        risk   = abs(price - stop) / price
-        reward = abs(target - price) / price
-        rr     = round(reward / risk, 2) if risk > 0 else 0.0
-
-        edge = calc_edge(self.db, self.sim.wins, self.sim.total)
-        conf = min(95, max(40, round(rec.acc * 0.6 + edge.score * 0.4)))
-
-        why = []
-        a2 = a  # already computed
-        if a2.moon_bull and pat.direction == 1:  why.append(f"{a2.moon_emoji} {a2.moon_phase} — waxing bull cycle")
-        if a2.moon_bear and pat.direction == -1: why.append(f"{a2.moon_emoji} {a2.moon_phase} — waning bear cycle")
-        if a2.merc_rx:   why.append("☿ Mercury Retrograde — reduce size 40%")
-        if a2.equinox:   why.append("⚡ Equinox active — inflection window")
-        if r.rsi < 32:   why.append(f"RSI {r.rsi} — oversold, demand zone")
-        if r.rsi > 68:   why.append(f"RSI {r.rsi} — overbought, distribution risk")
-        if r.wick_dn:    why.append("Wick rejection — liquidity grab")
-        if r.vol_r > 1.8:why.append(f"Volume {r.vol_r:.1f}× — conviction move")
-        if r.funding < -0.025: why.append(f"Funding {r.funding:.3f}% — squeeze building")
-
-        return {
-            "pattern":    pat.name,
-            "category":   pat.cat,
-            "direction":  "LONG" if pat.direction == 1 else "SHORT" if pat.direction == -1 else "NEUTRAL",
-            "dir_arrow":  "▲" if pat.direction == 1 else "▼",
-            "accuracy":   rec.acc,
-            "ev":         rec.ev,
-            "observations": rec.occ,
-            "confidence": conf,
-            "entry":      round(price, 2),
-            "stop":       round(stop, 2),
-            "target":     round(target, 2),
-            "rr":         rr,
-            "leverage":   get_lev(rec.acc),
-            "size_pct":   min(20, max(5, round((rec.acc - 42) / 2))),
-            "why":        why[:4],
-            "ingredients":pat.ingredients,
-            "merc_rx":    a2.merc_rx,
-        }
+        return max(all_sigs, key=lambda s: s["score"] + s["confidence"] * 0.5)
 
     def get_edge(self) -> EdgeScore:
-        return calc_edge(self.db, self.sim.wins, self.sim.total)
+        # Aggregate edge across all coin DBs
+        all_records: list = []
+        for sc in self.scanners.values():
+            all_records.extend(sc.db.records.values())
+        pats = [r for r in all_records if r.occ >= 2]
+        if not pats:
+            return calc_edge(self.db, self.sim.wins, self.sim.total)
+        avg = sum(r.acc for r in pats) / len(pats)
+        elite = sum(1 for r in pats if r.acc >= 70)
+        prof  = sum(1 for r in pats if r.ev > 0)
+        obs   = sum(r.occ for r in pats)
+        cons  = round(self.sim.wins / self.sim.total * 100) if self.sim.total > 0 else 0
+        score = min(100, round(
+            avg * 0.35 + (elite / max(len(pats), 1)) * 30 +
+            (prof / max(len(pats), 1)) * 20 + min(obs / 300, 1) * 15
+        ))
+        status = ("ELITE" if score >= 85 else "SHARP" if score >= 70 else
+                  "EDGE" if score >= 50 else "FORMING" if score >= 30 else "BLURRY")
+        return EdgeScore(score, status, len(pats), obs, elite, cons)
 
     def get_astro(self) -> AstroState:
         return get_astro()

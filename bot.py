@@ -127,12 +127,13 @@ def escape(txt: str) -> str:
 # ── MESSAGE FORMATTERS ───────────────────────────────────────────
 
 def fmt_signal(sig: dict, lp_btc: float) -> str:
-    d  = sig["direction"]
-    de = dir_emoji(d)
+    d    = sig["direction"]
+    de   = dir_emoji(d)
+    coin = sig.get("coin", "BTC")
     ev_sign = "+" if sig['ev'] > 0 else ""
     ev_str  = escape(ev_sign + str(sig['ev']) + "%")
     lines = [
-        f"{de} *{escape(d)} — {escape(sig['pattern'])}*",
+        f"{de} *{escape(coin)} — {escape(d)} — {escape(sig['pattern'])}*",
         f"",
         f"📊 *Category:* {escape(sig['category'])}",
         f"🎯 *Accuracy:* {sig['accuracy']}%",
@@ -243,10 +244,11 @@ def fmt_live_trade(lt: LiveTradeState, btc: float) -> str:
 def fmt_trade_close(ev: dict) -> str:
     e    = "✅" if ev["win"] else "❌"
     mode = "📄 DEMO" if ev["paper"] else "💸 LIVE"
+    coin = ev.get("coin", "BTC")
     pnl  = escape(f"{'+'  if ev['pnl_pct']  >= 0 else ''}{ev['pnl_pct']}%")
     usdt = escape(f"{'+'  if ev['pnl_usdt'] >= 0 else ''}{ev['pnl_usdt']} USDT")
     lines = [
-        f"{e} *Trade Closed — {escape(mode)}*",
+        f"{e} *{escape(coin)} Trade Closed — {escape(mode)}*",
         f"",
         f"{'🟢' if ev['direction']=='LONG' else '🔴'} {escape(ev['direction'])} — {escape(ev['pattern'])}",
         f"",
@@ -826,15 +828,15 @@ async def engine_loop(app: Application):
 
     while True:
         try:
-            # Fetch price every PRICE_INTERVAL seconds
+            # Fetch all coin prices every PRICE_INTERVAL seconds
             price_tick   += TICK_INTERVAL
             onchain_tick += TICK_INTERVAL
             if price_tick >= PRICE_INTERVAL:
-                await engine.update_price(session)
+                await engine.update_all_prices(session)
                 price_tick = 0
-            # Refresh real on-chain data every 5 minutes
+            # Refresh real on-chain data for all coins every 5 minutes
             if onchain_tick >= 300:
-                await engine.refresh_onchain(session)
+                await engine.refresh_all_onchain(session)
                 onchain_tick = 0
 
             # ── CHECK OPEN TRADE (always — even when paused) ──────────
@@ -847,16 +849,20 @@ async def engine_loop(app: Application):
                 await asyncio.sleep(TICK_INTERVAL)
                 continue
 
-            # Tick the engine
-            trade = engine.tick()
+            # Tick all coins — learn from every market simultaneously
+            engine.tick_all()
 
             # ── SIGNAL ALERT + TRADE OPEN ─────────────
             sig = engine.get_signal()
-            if sig and sig["pattern"] != last_signal_id:
+            sig_key = f"{sig.get('symbol','')}{sig['pattern']}" if sig else None
+            if sig and sig_key != last_signal_id:
                 if sig["confidence"] >= SIGNAL_MIN_CONF and sig["accuracy"] >= SIGNAL_MIN_ACC:
-                    last_signal_id = sig["pattern"]
-                    log.info(f"Signal fired: {sig['direction']} {sig['pattern']} conf={sig['confidence']}")
-                    await broadcast(app, fmt_signal(sig, engine.live_price.btc))
+                    last_signal_id = sig_key
+                    coin = sig.get("coin", "BTC")
+                    log.info(f"Signal: {coin} {sig['direction']} {sig['pattern']} conf={sig['confidence']}")
+                    sc = engine.scanners.get(sig.get("symbol", "BTCUSDT"))
+                    sig_price = sc.live_price.btc if sc else engine.live_price.btc
+                    await broadcast(app, fmt_signal(sig, sig_price))
                     # Open live / paper trade
                     if not engine.live_trade.active:
                         lt = await engine.open_live_trade(session, sig, TRADE_CAPITAL_USDT)
@@ -864,6 +870,7 @@ async def engine_loop(app: Application):
                         log.info(f"Trade opened [{mode}] ${TRADE_CAPITAL_USDT}: {lt.pattern} order={lt.order_id}")
             elif not sig:
                 last_signal_id = None
+                sig_key = None
 
             # ── EDGE SCORE ALERT ──────────────────────
             edge = engine.get_edge()
