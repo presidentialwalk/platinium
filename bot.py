@@ -36,7 +36,10 @@ ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 BITGET_API_KEY    = os.getenv("BITGET_API_KEY", "")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
 BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
-PAPER_MODE         = os.getenv("PAPER_MODE", "true").lower() != "false"
+# Auto-live: if all 3 keys are present, default is live unless explicitly overridden to paper
+_keys_present = bool(BITGET_API_KEY and BITGET_API_SECRET and BITGET_PASSPHRASE)
+_paper_default = "false" if _keys_present else "true"
+PAPER_MODE         = os.getenv("PAPER_MODE", _paper_default).lower() != "false"
 TRADE_CAPITAL_USDT = float(os.getenv("TRADE_CAPITAL_USDT", "1"))   # editable via /settrade
 DEMO_BALANCE_USDT  = float(os.getenv("DEMO_BALANCE_USDT", "100"))  # starting demo wallet
 
@@ -83,6 +86,13 @@ session: Optional[aiohttp.ClientSession] = None
 mas_brain = MASBrain(engine)
 dashboard  = Dashboard(engine, mas_brain)
 engine_paused: bool = False
+
+_mode_str = "PAPER" if PAPER_MODE else "LIVE — REAL MONEY"
+_keys_str = "keys OK" if _executor.enabled else "NO KEYS"
+log.info(f"╔══════════════════════════════════════╗")
+log.info(f"║  PLATINIUM  │  {_mode_str:<22}║")
+log.info(f"║  Bitget: {_keys_str:<9}│  ${TRADE_CAPITAL_USDT} per trade   ║")
+log.info(f"╚══════════════════════════════════════╝")
 
 
 # ── EMOJI / FORMAT HELPERS ───────────────────────────────────────
@@ -944,9 +954,19 @@ async def post_init(app: Application):
     # Send startup message to configured chat
     if CHAT_ID:
         try:
+            mode_icon = "💸" if not PAPER_MODE else "📄"
+            mode_label = escape("LIVE — REAL MONEY" if not PAPER_MODE else "PAPER")
+            keys_label = escape("✅ Bitget connected" if _executor.enabled else "⚠️ No keys — paper only")
+            size_label = escape(f"${TRADE_CAPITAL_USDT} per trade")
             await app.bot.send_message(
                 chat_id=int(CHAT_ID),
-                text="🔱 *PLATINIUM is live*\n\nEngine running\\. Patterns scanning\\. I'll alert you when signals fire\\.\n\nUse /help to see commands\\.",
+                text=(
+                    f"🔱 *PLATINIUM online*\n\n"
+                    f"{mode_icon} Mode: *{mode_label}*\n"
+                    f"🔑 {keys_label}\n"
+                    f"💼 Size: *{size_label}*\n\n"
+                    f"Engine scanning\\. I'll alert you when signals fire\\."
+                ),
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=main_keyboard()
             )
