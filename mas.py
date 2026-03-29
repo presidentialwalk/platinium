@@ -8,15 +8,30 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import collections
 from dataclasses import dataclass, field
 from typing import Optional
 import aiohttp
 
+try:
+    import anthropic
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
+
 log = logging.getLogger(__name__)
 
-IDEAS_FILE = os.getenv("IDEAS_FILE", "platinium_ideas.json")
+IDEAS_FILE        = os.getenv("IDEAS_FILE", "platinium_ideas.json")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+_AI_SYSTEM = (
+    "You are a professional crypto trading analyst embedded inside an algorithmic trading system. "
+    "You analyse raw market data and return concise, actionable insights. "
+    "Always respond with a single JSON object — nothing else. Format:\n"
+    '{"bias":"BULL|BEAR|NEUTRAL|PATTERN","confidence":<int 0-100>,"title":"<short title>","body":"<2-4 sentence analysis>"}'
+)
 
 
 # ═══════════════════════════════════════════════
@@ -60,7 +75,62 @@ class MASBrain:
         self.discoveries: collections.deque = collections.deque(maxlen=500)
         self.ideas: list = []
         self._sse_queues: list = []
+        self._ai_client: Optional["anthropic.AsyncAnthropic"] = None
         self._load_ideas()
+        self._init_ai()
+
+    def _init_ai(self):
+        if not _ANTHROPIC_AVAILABLE:
+            log.info("MAS: anthropic package not installed — AI reasoning disabled")
+            return
+        if not ANTHROPIC_API_KEY:
+            log.info("MAS: ANTHROPIC_API_KEY not set — AI reasoning disabled")
+            return
+        self._ai_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        log.info("MAS: Claude AI client initialised (claude-opus-4-6 / claude-haiku-4-5)")
+
+    # ── AI HELPER ───────────────────────────────
+
+    async def _call_ai(self, user_prompt: str, deep: bool = False) -> Optional[dict]:
+        """Call Claude, parse JSON response. Returns None on any failure."""
+        if not self._ai_client:
+            return None
+        try:
+            model  = "claude-opus-4-6" if deep else "claude-haiku-4-5"
+            kwargs = {
+                "model":    model,
+                "max_tokens": 2048 if deep else 512,
+                "system":   _AI_SYSTEM,
+                "messages": [{"role": "user", "content": user_prompt}],
+            }
+            if deep:
+                kwargs["thinking"] = {"type": "adaptive"}
+
+            async with self._ai_client.messages.stream(**kwargs) as stream:
+                msg = await stream.get_final_message()
+
+            # Skip thinking blocks, grab first text block
+            text = ""
+            for block in msg.content:
+                if hasattr(block, "text"):
+                    text = block.text
+                    break
+
+            if not text:
+                return None
+
+            m = re.search(r"\{.*?\}", text, re.DOTALL)
+            if m:
+                parsed = json.loads(m.group())
+                # Validate required keys
+                if all(k in parsed for k in ("bias", "confidence", "title", "body")):
+                    parsed["confidence"] = max(0, min(100, int(parsed["confidence"])))
+                    if parsed["bias"] not in ("BULL", "BEAR", "NEUTRAL", "PATTERN"):
+                        parsed["bias"] = "NEUTRAL"
+                    return parsed
+        except Exception as e:
+            log.debug(f"AI call failed: {e}")
+        return None
 
     # ── PERSISTENCE ─────────────────────────────
 
@@ -122,6 +192,16 @@ class MASBrain:
             delta = now - prev
             d_str = ("+" if delta >= 0 else "") + str(delta)
 
+            # Try AI analysis first
+            ai = await self._call_ai(
+                f"Fear & Greed Index: current={now} ({label}), yesterday={prev}, delta={d_str}. "
+                f"Analyse this for crypto trading. What is the directional bias and what should a trader do?"
+            )
+            if ai:
+                self.push(Discovery("FearGreed", ai["title"], ai["body"], ai["bias"], ai["confidence"]))
+                return
+
+            # Rule-based fallback
             if now <= 20:
                 bias, conf = "BULL", min(88, 60 + (25 - now))
                 title = f"Extreme Fear ({now}) — contrarian LONG zone"
@@ -144,8 +224,7 @@ class MASBrain:
                 bias, conf = "NEUTRAL", 48
                 title = f"Greed zone ({now}) — be selective"
                 body  = (f"Fear & Greed at {now} ({label}). "
-                         f"Market euphoria building. Quality setups only, "
-                         f"avoid chasing breakouts.")
+                         f"Market euphoria building. Quality setups only, avoid chasing breakouts.")
             else:
                 bias, conf = "NEUTRAL", 42
                 title = f"Sentiment neutral ({now} — {label})"
@@ -165,6 +244,17 @@ class MASBrain:
             rate = float(data["lastFundingRate"]) * 100
             mark = float(data["markPrice"])
 
+            # Try AI analysis
+            ai = await self._call_ai(
+                f"BTC perpetual futures funding rate: {rate:.4f}%. Mark price: ${mark:,.0f}. "
+                f"Positive funding = longs pay shorts. Negative = shorts pay longs. "
+                f"Analyse the directional implications for traders."
+            )
+            if ai:
+                self.push(Discovery("Funding", ai["title"], ai["body"], ai["bias"], ai["confidence"]))
+                return
+
+            # Rule-based fallback
             if rate > 0.08:
                 bias, conf = "BEAR", min(85, 55 + int((rate - 0.08) * 200))
                 title = f"Funding HIGH ({rate:.4f}%) — longs overextended"
@@ -202,6 +292,17 @@ class MASBrain:
             chg_24h  = round(d["market_cap_change_percentage_24h_usd"], 2)
             sign     = "+" if chg_24h >= 0 else ""
 
+            # Try AI analysis
+            ai = await self._call_ai(
+                f"BTC dominance: {dom}%. Total crypto market 24h change: {sign}{chg_24h}%. "
+                f"Analyse capital rotation dynamics — is this a Bitcoin season, altcoin season, or neutral? "
+                f"What is the best trading approach right now?"
+            )
+            if ai:
+                self.push(Discovery("Dominance", ai["title"], ai["body"], ai["bias"], ai["confidence"]))
+                return
+
+            # Rule-based fallback
             if dom > 58:
                 bias, conf = "BULL", 64
                 title = f"BTC Dominance HIGH ({dom}%) — Bitcoin season"
@@ -235,6 +336,17 @@ class MASBrain:
             names = [c["item"]["name"] for c in coins]
             syms  = [c["item"]["symbol"].upper() for c in coins]
 
+            # Try AI analysis
+            ai = await self._call_ai(
+                f"Top 7 trending coins on CoinGecko right now: {', '.join(names)} ({', '.join(syms)}). "
+                f"Analyse what this trending data tells us about current market sentiment and momentum. "
+                f"Which coins are worth watching for breakout setups?"
+            )
+            if ai:
+                self.push(Discovery("TrendScanner", ai["title"], ai["body"], ai["bias"], ai["confidence"]))
+                return
+
+            # Rule-based fallback
             self.push(Discovery(
                 "TrendScanner",
                 f"Trending: {', '.join(syms[:4])}",
@@ -250,7 +362,7 @@ class MASBrain:
 
     async def _agent_pattern_correlator(self):
         try:
-            trades = self.engine.sim.trades
+            trades = self.engine.trade_history
             if len(trades) < 8:
                 return
 
@@ -258,7 +370,7 @@ class MASBrain:
             wins  = sum(1 for t in trades if t.get("win"))
             wr    = round(wins / total * 100, 1)
 
-            # Best and worst patterns in last 50 trades
+            # Best and worst patterns in last 50 real trades
             pat_stats: dict = {}
             for t in trades[:50]:
                 p = t.get("pattern", "?")
@@ -285,23 +397,45 @@ class MASBrain:
                 else:
                     break
 
+            # Recent P&L
+            recent_pnl = [t.get("pnl_pct", 0) for t in trades[:20]]
+            avg_pnl    = round(sum(recent_pnl) / len(recent_pnl), 2) if recent_pnl else 0
+
+            # Try deep AI analysis (Opus with adaptive thinking)
+            pat_summary = ", ".join(
+                f"{name}:{v['w']}W/{v['l']}L"
+                for name, v in list(pat_stats.items())[:8]
+            )
+            ai = await self._call_ai(
+                f"Real live trading results — {total} trades, {wr}% win rate. "
+                f"Current losing streak: {streak}. Avg P&L last 20 trades: {avg_pnl}%. "
+                f"Pattern breakdown: {pat_summary}. "
+                f"Best pattern: '{best_name}' at {best_acc}% accuracy. "
+                f"Analyse edge quality, pattern reliability, and whether to increase or reduce position sizing.",
+                deep=True
+            )
+            if ai:
+                self.push(Discovery("PatternMiner", ai["title"], ai["body"], ai["bias"], ai["confidence"]))
+                return
+
+            # Rule-based fallback
             if streak >= 4:
                 bias, conf = "NEUTRAL", 72
                 title = f"WARNING: {streak}-trade losing streak"
-                body  = (f"Last {streak} trades all closed at a loss. "
-                         f"Pattern DB recalibrating. Reducing sim exposure. "
-                         f"Overall win rate still {wr}% over {total} trades.")
+                body  = (f"Last {streak} live trades all closed at a loss. "
+                         f"Pattern DB recalibrating. Review entry quality. "
+                         f"Overall win rate: {wr}% over {total} trades.")
             elif best_acc >= 72 and (best_d["w"] + best_d["l"]) >= 3:
                 bias, conf = "BULL", 68
                 title = f"Hot pattern: '{best_name}' — {best_acc}% recently"
                 body  = (f"'{best_name}' outperforming: {best_d['w']}W / {best_d['l']}L "
-                         f"in last 50 trades. Edge signal is sharpening. "
-                         f"Overall: {wr}% WR across {total} trades.")
+                         f"in last 50 trades. Edge is sharpening. "
+                         f"Overall: {wr}% WR across {total} live trades.")
             else:
                 bias, conf = "NEUTRAL", 48
-                title = f"Pattern DB: {wr}% win rate — {total} trades logged"
+                title = f"Pattern DB: {wr}% win rate — {total} trades"
                 body  = (f"Database nominal. Best recent: '{best_name}' at {best_acc}%. "
-                         f"Keep sampling — accuracy compounds with more data.")
+                         f"Keep sampling — accuracy compounds with real data.")
 
             self.push(Discovery("PatternMiner", title, body, bias, conf))
         except Exception as e:
@@ -311,24 +445,49 @@ class MASBrain:
 
     async def _agent_edge_analyst(self):
         try:
-            records     = list(self.engine.db.records.values())
-            elite       = [r for r in records if r.acc >= 70 and r.occ >= 5]
-            underperform= [r for r in records if r.acc < 40 and r.occ >= 5]
-            total_obs   = sum(r.occ for r in records)
-            avg_acc     = round(sum(r.acc for r in records) / len(records), 1) if records else 0
+            # Pull records from ALL coin scanners
+            records      = self.engine.get_edge_records()
+            elite        = [r for r in records if r.acc >= 70 and r.occ >= 5]
+            underperform = [r for r in records if r.acc < 40 and r.occ >= 5]
+            total_obs    = sum(r.occ for r in records)
+            avg_acc      = round(sum(r.acc for r in records) / len(records), 1) if records else 0
+            total_wins   = sum(r.wins for r in records)
+            overall_wr   = round(total_wins / total_obs * 100, 1) if total_obs > 0 else 0
 
+            # Top patterns by score
+            top5 = sorted(records, key=lambda r: r.score, reverse=True)[:5]
+            top5_str = "; ".join(
+                f"{r.pattern.name}(acc={r.acc}%,occ={r.occ},ev={r.ev:+.2f}%)"
+                for r in top5
+            )
+
+            # Try deep AI analysis
+            ai = await self._call_ai(
+                f"Live trading edge analysis across {len(self.engine.scanners)} coins. "
+                f"Total pattern observations: {total_obs}. Overall win rate from DB: {overall_wr}%. "
+                f"Avg pattern accuracy: {avg_acc}%. Elite patterns (≥70% acc, ≥5 occ): {len(elite)}. "
+                f"Underperforming patterns (<40% acc, ≥5 occ): {len(underperform)}. "
+                f"Top 5 patterns by score: {top5_str}. "
+                f"Assess the overall edge quality and what actions to take.",
+                deep=True
+            )
+            if ai:
+                self.push(Discovery("EdgeAnalyst", ai["title"], ai["body"], ai["bias"], ai["confidence"]))
+                return
+
+            # Rule-based fallback
             if elite:
                 top = max(elite, key=lambda r: r.score)
                 title = f"Elite edge: '{top.pattern.name}' — {top.acc}% acc"
                 body  = (f"Top performer: '{top.pattern.name}' "
                          f"({top.acc}% acc, EV={top.ev:+.2f}%, {top.occ} occurrences, score={top.score:.0f}). "
                          f"{len(elite)} elite patterns / {len(underperform)} underperforming. "
-                         f"Total observations: {total_obs}. Avg accuracy: {avg_acc}%.")
+                         f"Total observations: {total_obs}. Overall WR: {overall_wr}%.")
                 bias, conf = "BULL", 72
             else:
                 title = f"Edge building: {total_obs} observations — avg {avg_acc}%"
                 body  = (f"No elite patterns yet (need ≥70% acc + 5 occurrences). "
-                         f"Sampling {len(records)} patterns. "
+                         f"Sampling {len(records)} patterns across {len(self.engine.scanners)} coins. "
                          f"Edge sharpens exponentially — keep the engine running.")
                 bias, conf = "NEUTRAL", 52
 
@@ -345,10 +504,23 @@ class MASBrain:
                 data = await r.json()
             oi = float(data["openInterest"])
 
-            # Get current price for context
-            price = self.engine.live_price.btc or 65000
+            # Get BTC price from scanner
+            btc_sc = self.engine.scanners.get("BTCUSDT")
+            price  = (btc_sc.live_price.btc if btc_sc and btc_sc.live_price.fresh else None) or 65000
             oi_usd = oi * price
 
+            # Try AI analysis
+            ai = await self._call_ai(
+                f"BTC perpetual open interest: {oi:.0f} BTC (${oi_usd/1e9:.2f}B). "
+                f"BTC price: ${price:,.0f}. "
+                f"Analyse OI levels — is leverage crowded or thin? What are the liquidation risks? "
+                f"What directional bias does this create for the next 24h?"
+            )
+            if ai:
+                self.push(Discovery("OpenInterest", ai["title"], ai["body"], ai["bias"], ai["confidence"]))
+                return
+
+            # Rule-based fallback
             if oi_usd > 15_000_000_000:
                 bias, conf = "BEAR", 58
                 title = f"Open Interest HIGH (${oi_usd/1e9:.1f}B) — crowded market"
