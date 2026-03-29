@@ -36,18 +36,12 @@ ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 BITGET_API_KEY    = os.getenv("BITGET_API_KEY", "")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
 BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
-# Auto-live: if all 3 keys are present, default is live unless explicitly overridden to paper
-_keys_present = bool(BITGET_API_KEY and BITGET_API_SECRET and BITGET_PASSPHRASE)
-_paper_default = "false" if _keys_present else "true"
-PAPER_MODE         = os.getenv("PAPER_MODE", _paper_default).lower() != "false"
 TRADE_CAPITAL_USDT = float(os.getenv("TRADE_CAPITAL_USDT", "1"))   # editable via /settrade
-DEMO_BALANCE_USDT  = float(os.getenv("DEMO_BALANCE_USDT", "100"))  # starting demo wallet
 
 # Alert thresholds
 SIGNAL_MIN_CONF   = int(os.getenv("MIN_CONFIDENCE", "62"))   # minimum confidence to alert
 SIGNAL_MIN_ACC    = int(os.getenv("MIN_ACCURACY", "60"))     # minimum accuracy to alert
 EDGE_ALERT_LEVELS = [50, 70, 85]                             # alert when edge crosses these
-EQUITY_ALERT_PCT  = float(os.getenv("EQUITY_ALERT_PCT", "5"))# alert every X% balance change
 
 # Intervals (seconds)
 TICK_INTERVAL  = int(os.getenv("TICK_INTERVAL", "30"))   # engine tick every 30s
@@ -68,17 +62,13 @@ _executor = BitgetExecutor(
     api_key=BITGET_API_KEY,
     secret=BITGET_API_SECRET,
     passphrase=BITGET_PASSPHRASE,
-    paper=PAPER_MODE,
 )
 engine = PlatiniumEngine(
     executor=_executor,
     trade_size_usdt=TRADE_CAPITAL_USDT,
-    demo_balance=DEMO_BALANCE_USDT,
 )
 last_signal_id: Optional[str] = None
 last_edge_level: int = 0
-last_equity_alert: float = 100.0
-last_equity_alert_time: float = 0.0
 last_astro_flags: dict = {"merc_rx": False, "equinox": False, "moon_idx": -1}
 subscribed_chats: set = set()
 session: Optional[aiohttp.ClientSession] = None
@@ -87,11 +77,11 @@ mas_brain = MASBrain(engine)
 dashboard  = Dashboard(engine, mas_brain)
 engine_paused: bool = False
 
-_mode_str = "PAPER" if PAPER_MODE else "LIVE — REAL MONEY"
-_keys_str = "keys OK" if _executor.enabled else "NO KEYS"
+_keys_str = "keys OK" if _executor.enabled else "NO KEYS — signals only"
 log.info(f"╔══════════════════════════════════════╗")
-log.info(f"║  PLATINIUM  │  {_mode_str:<22}║")
-log.info(f"║  Bitget: {_keys_str:<9}│  ${TRADE_CAPITAL_USDT} per trade   ║")
+log.info(f"║  PLATINIUM  │  LIVE — REAL MONEY     ║")
+log.info(f"║  Bitget: {_keys_str:<29}║")
+log.info(f"║  ${TRADE_CAPITAL_USDT} per trade │  20 coins scanning   ║")
 log.info(f"╚══════════════════════════════════════╝")
 
 
@@ -172,35 +162,18 @@ def fmt_edge(edge) -> str:
     ])
 
 
-def fmt_equity(sim_summary: dict) -> str:
-    s      = sim_summary
-    ep     = pnl_emoji(s["pnl_pct"])
-    tag    = "📄 Demo" if PAPER_MODE else "💸 Live"
-    pnl_u  = s.get("pnl_usdt", 0)
-    sign_p = "+" if s["pnl_pct"] >= 0 else ""
-    sign_u = "+" if pnl_u >= 0 else ""
-    # escape all floats — unescaped "." breaks MarkdownV2
-    bal    = escape(fmt_num(s["balance"]))
-    start  = escape(fmt_num(s["start_balance"]))
-    peak   = escape(fmt_num(s["peak"]))
-    pct    = escape(f"{sign_p}{s['pnl_pct']}%")
-    usdt   = escape(f"{sign_u}{pnl_u} USDT")
-    dd     = escape(f"{s['drawdown']}%")
-    wr     = escape(f"{s['wr']}%")
-    lines  = [
-        f"{ep} *{escape(tag)}*",
-        "",
-        f"💰 Balance: *{bal}*  \\(start: {start}\\)",
-        f"📈 P&L: *{pct}*  \\({usdt}\\)",
-        f"🏔 Peak: *{peak}*",
-        f"📉 Drawdown: *{dd}*",
+def fmt_equity(s: dict, live_balance: float = 0.0) -> str:
+    bal = escape(fmt_num(live_balance)) if live_balance else escape("fetching…")
+    wr  = escape(f"{s['wr']}%")
+    lines = [
+        f"💰 *Wallet*",
+        f"",
+        f"💵 Balance: *{bal}* USDT",
         f"🎯 Win Rate: *{wr}*",
         f"📊 Trades: *{s['total']}*  \\({s['wins']}W / {s['losses']}L\\)",
+        f"🔬 Edge: *{s['edge_score']} — {escape(s['edge_status'])}*",
+        f"⭐ Elite patterns: *{s['elite']}*",
     ]
-    if s["cons_win"] > 1:
-        lines.append(f"🔥 Streak: *{s['cons_win']}W* winning")
-    elif s["cons_loss"] > 1:
-        lines.append(f"❄️ Streak: *{s['cons_loss']}L* losing")
     return "\n".join(lines)
 
 
@@ -222,7 +195,7 @@ def fmt_astro(a) -> str:
 
 
 def fmt_live_trade(lt: LiveTradeState, btc: float) -> str:
-    mode = "📄 PAPER" if lt.paper else "💸 LIVE"
+    mode = "💸 LIVE"
     d = "🟢 LONG" if lt.direction == 1 else "🔴 SHORT"
     dur = round((time.time() - lt.opened_at) / 60, 1)
     dist_tp = round(abs(btc - lt.target) / lt.entry * 100, 2)
@@ -257,8 +230,6 @@ def fmt_trade_close(ev: dict) -> str:
         f"💰 P&L:      *{pnl}*  \\({usdt}\\)",
         f"⏱ Duration: {ev['duration']}m",
     ]
-    if ev.get("demo_balance") is not None:
-        lines.append(f"💼 Demo wallet: *{escape(fmt_num(ev['demo_balance']))}*")
     return "\n".join(lines)
 
 
@@ -445,8 +416,11 @@ async def cmd_edge(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_equity(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     summary = engine.get_summary()
+    live_bal = 0.0
+    if session:
+        live_bal = await engine.get_live_balance(session)
     await update.message.reply_text(
-        fmt_equity(summary), parse_mode=ParseMode.MARKDOWN_V2,
+        fmt_equity(summary, live_bal), parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=main_keyboard())
 
 
@@ -489,9 +463,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     m = int((uptime % 3600) // 60)
     s = engine.get_summary()
     lt = engine.get_live_trade()
-    trade_line = f"⚡ Trade: *{'OPEN — ' + escape(lt.pattern) if lt.active else 'none'}*"
-    mode_line  = f"💸 Mode: *{'PAPER' if PAPER_MODE else 'LIVE — REAL MONEY'}*"
-    bitget_line = f"🔑 Bitget: *{'✅ ' + ('paper' if PAPER_MODE else 'live') if _executor.enabled else '⚠️ keys not set'}*"
+    trade_line  = f"⚡ Trade: *{'OPEN — ' + escape(lt.symbol.replace('USDT','')) + ' ' + escape(lt.pattern) if lt.active else 'none'}*"
+    mode_line   = f"💸 Mode: *LIVE — REAL MONEY*"
+    bitget_line = f"🔑 Bitget: *{'✅ connected' if _executor.enabled else '⚠️ keys not set'}*"
     txt = "\n".join([
         "✅ *PLATINIUM Status*",
         "",
@@ -580,11 +554,10 @@ async def cmd_settrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lt = engine.get_live_trade()
     if not lt.active:
-        mode = "PAPER" if PAPER_MODE else "LIVE"
         bitget_ok = "✅ Connected" if _executor.enabled else "⚠️ No keys set"
         await update.message.reply_text(
             f"📭 *No open trade right now*\n\n"
-            f"Mode: *{escape(mode)}*\n"
+            f"Mode: *LIVE*\n"
             f"Bitget: *{escape(bitget_ok)}*\n"
             f"Capital per trade: *{escape(fmt_num(TRADE_CAPITAL_USDT))}*",
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -637,17 +610,17 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if lt.active:
             await edit(fmt_live_trade(lt, engine.live_price.btc))
         else:
-            mode    = "PAPER" if PAPER_MODE else "LIVE"
             bitget  = "✅ Connected" if _executor.enabled else "⚠️ Keys not set"
             await edit(
                 f"📭 *No open trade*\n\n"
-                f"Mode: *{escape(mode)}*\n"
+                f"Mode: *LIVE*\n"
                 f"Bitget: *{escape(bitget)}*\n"
                 f"Size per trade: *{escape(fmt_num(TRADE_CAPITAL_USDT))}*"
             )
 
     elif data == "equity":
-        await edit(fmt_equity(engine.get_summary()))
+        live_bal = await engine.get_live_balance(session) if session else 0.0
+        await edit(fmt_equity(engine.get_summary(), live_bal))
 
     elif data == "edge":
         await edit(fmt_edge(engine.get_edge()))
@@ -680,7 +653,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"👥 Subscribers: *{len(subscribed_chats)}*",
             "",
             f"⚡ Trade: *{('OPEN — ' + escape(lt.pattern)) if lt.active else 'none'}*",
-            f"💸 Mode: *{'PAPER' if PAPER_MODE else 'LIVE'}*",
+            f"💸 Mode: *LIVE*",
             f"🔑 Bitget: *{'✅' if _executor.enabled else '⚠️ keys not set'}*",
         ]))
 
@@ -817,7 +790,7 @@ async def broadcast(app: Application, text: str, keyboard=None):
 
 async def engine_loop(app: Application):
     """Main engine loop — ticks every TICK_INTERVAL seconds."""
-    global last_signal_id, last_edge_level, last_equity_alert, last_astro_flags
+    global last_signal_id, last_edge_level, last_astro_flags
     global session
 
     session = aiohttp.ClientSession()
@@ -866,8 +839,7 @@ async def engine_loop(app: Application):
                     # Open live / paper trade
                     if not engine.live_trade.active:
                         lt = await engine.open_live_trade(session, sig, TRADE_CAPITAL_USDT)
-                        mode = "PAPER" if lt.paper else "LIVE"
-                        log.info(f"Trade opened [{mode}] ${TRADE_CAPITAL_USDT}: {lt.pattern} order={lt.order_id}")
+                        log.info(f"Trade opened [LIVE] {lt.symbol} ${TRADE_CAPITAL_USDT}: {lt.pattern} order={lt.order_id}")
             elif not sig:
                 last_signal_id = None
                 sig_key = None
@@ -882,17 +854,7 @@ async def engine_loop(app: Application):
                     await broadcast(app, txt)
                     break
 
-            # ── EQUITY ALERT ──────────────────────────
-            bal = engine.sim.balance
-            pct_change = abs(bal - last_equity_alert) / last_equity_alert * 100
-            now_t = time.time()
-            if (pct_change >= EQUITY_ALERT_PCT and engine.sim.total > 0
-                    and now_t - last_equity_alert_time >= 3600):  # max 1 alert/hour
-                last_equity_alert = bal
-                last_equity_alert_time = now_t
-                summary = engine.get_summary()
-                log.info(f"Equity update: ${bal:.2f}")
-                await broadcast(app, fmt_equity(summary))
+            # (equity alerts removed — check /wallet for live balance)
 
             # ── ASTRO ALERTS ──────────────────────────
             a = engine.get_astro()
@@ -935,7 +897,7 @@ async def daily_summary_loop(app: Application):
     last_day = -1
     while True:
         now = datetime.now(timezone.utc)
-        if now.hour == DAILY_HOUR and now.day != last_day and engine.sim.total > 0:
+        if now.hour == DAILY_HOUR and now.day != last_day and len(engine.trade_history) > 0:
             last_day = now.day
             summary = engine.get_summary()
             log.info("Sending daily summary")
@@ -961,17 +923,16 @@ async def post_init(app: Application):
     # Send startup message to configured chat
     if CHAT_ID:
         try:
-            mode_icon = "💸" if not PAPER_MODE else "📄"
-            mode_label = escape("LIVE — REAL MONEY" if not PAPER_MODE else "PAPER")
-            keys_label = escape("✅ Bitget connected" if _executor.enabled else "⚠️ No keys — paper only")
+            keys_label = escape("✅ Bitget connected" if _executor.enabled else "⚠️ No keys — signals only")
             size_label = escape(f"${TRADE_CAPITAL_USDT} per trade")
             await app.bot.send_message(
                 chat_id=int(CHAT_ID),
                 text=(
-                    f"🔱 *PLATINIUM online*\n\n"
-                    f"{mode_icon} Mode: *{mode_label}*\n"
+                    f"🔱 *PLATINIUM online — LIVE*\n\n"
+                    f"💸 Mode: *LIVE — REAL MONEY*\n"
                     f"🔑 {keys_label}\n"
-                    f"💼 Size: *{size_label}*\n\n"
+                    f"💼 Size: *{size_label}*\n"
+                    f"🌐 Scanning: *20 coins*\n\n"
                     f"Engine scanning\\. I'll alert you when signals fire\\."
                 ),
                 parse_mode=ParseMode.MARKDOWN_V2,

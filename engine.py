@@ -645,182 +645,40 @@ class EdgeScore:
     consistency: int
 
 
-def calc_edge(db: Database, sim_wins: int, sim_total: int) -> EdgeScore:
-    pats = [r for r in db.records.values() if r.occ >= 2]
+def calc_edge(records: list) -> EdgeScore:
+    """Compute edge score from real pattern records across all coins."""
+    pats = [r for r in records if r.occ >= 2]
     if not pats:
         return EdgeScore(0, "BLURRY", 0, 0, 0, 0)
-    avg = sum(r.acc for r in pats) / len(pats)
+    avg   = sum(r.acc for r in pats) / len(pats)
     elite = sum(1 for r in pats if r.acc >= 70)
-    prof = sum(1 for r in pats if r.ev > 0)
-    obs = sum(r.occ for r in pats)
-    cons = round(sim_wins / sim_total * 100) if sim_total > 0 else 0
+    prof  = sum(1 for r in pats if r.ev > 0)
+    obs   = sum(r.occ for r in pats)
+    total_w = sum(r.wins for r in pats)
+    total_t = sum(r.occ  for r in pats)
+    cons  = round(total_w / total_t * 100) if total_t > 0 else 0
     score = min(100, round(
         avg * 0.35 +
         (elite / max(len(pats), 1)) * 30 +
-        (prof / max(len(pats), 1)) * 20 +
+        (prof  / max(len(pats), 1)) * 20 +
         min(obs / 300, 1) * 15
     ))
-    if score >= 85:
-        status = "ELITE"
-    elif score >= 70:
-        status = "SHARP"
-    elif score >= 50:
-        status = "FORMING"
-    else:
-        status = "BLURRY"
+    status = ("ELITE"   if score >= 85 else
+              "SHARP"   if score >= 70 else
+              "EDGE"    if score >= 50 else
+              "FORMING" if score >= 30 else "BLURRY")
     return EdgeScore(score, status, len(pats), obs, elite, cons)
 
 
 # ═══════════════════════════════════════════════
-# SIMULATION ENGINE (real conditions)
+# LEVERAGE HELPER
 # ═══════════════════════════════════════════════
-
-MAKER_FEE = 0.0002
-TAKER_FEE = 0.0005
-SLIPPAGE   = 0.0003
-ROUND_TRIP = (MAKER_FEE + TAKER_FEE + SLIPPAGE) * 2
-MIN_BALANCE = 2.0
-MAX_LEVERAGE = 10
-
-
-@dataclass
-class SimState:
-    start_balance: float = 100.0
-    balance: float = field(init=False)
-    peak: float = field(init=False)
-    wins: int = 0
-    losses: int = 0
-    total: int = 0
-    cons_loss: int = 0
-    cons_win: int = 0
-    curve: list = field(default_factory=list)
-    trades: list = field(default_factory=list)
-
-    def __post_init__(self):
-        self.balance = self.start_balance
-        self.peak    = self.start_balance
-        self.curve   = [self.start_balance]
-
-    @property
-    def wr(self) -> float:
-        return round(self.wins / self.total * 100, 1) if self.total else 0.0
-
-    @property
-    def drawdown(self) -> float:
-        return round((self.peak - self.balance) / self.peak * 100, 1) if self.peak > 0 else 0.0
-
-    @property
-    def pnl_pct(self) -> float:
-        return round((self.balance - self.start_balance) / self.start_balance * 100, 1)
-
-    def to_dict(self) -> dict:
-        return {
-            "balance": self.balance,
-            "peak": self.peak,
-            "wins": self.wins,
-            "losses": self.losses,
-            "total": self.total,
-            "cons_win": self.cons_win,
-            "cons_loss": self.cons_loss,
-            "curve": self.curve[-200:],   # keep last 200 points
-            "trades": self.trades[-100:], # keep last 100 trades
-        }
-
-    def load_dict(self, data: dict):
-        self.balance   = data.get("balance", self.start_balance)
-        self.peak      = data.get("peak", self.balance)
-        self.wins      = data.get("wins", 0)
-        self.losses    = data.get("losses", 0)
-        self.total     = data.get("total", 0)
-        self.cons_win  = data.get("cons_win", 0)
-        self.cons_loss = data.get("cons_loss", 0)
-        self.curve     = data.get("curve", [self.balance])
-        self.trades    = data.get("trades", [])
-
 
 def get_lev(acc: float) -> int:
     if acc >= 80: return 8
     if acc >= 70: return 6
     if acc >= 60: return 4
     return 3
-
-
-def pos_size(sim: SimState, acc: float) -> float:
-    f = 0.08 + (acc - 50) / 1000
-    f = min(f, 0.20)
-    if sim.cons_loss >= 2: f *= 0.6
-    if sim.cons_loss >= 4: f *= 0.4
-    if sim.balance < sim.peak * 0.7: f *= 0.5  # drawdown protection
-    return max(1.0, sim.balance * f)
-
-
-def execute_trade(sim: SimState, db: Database, rec: PatternRecord,
-                  r: Readings, a: AstroState,
-                  size_usdt: float = 1.0) -> Optional[dict]:
-    if sim.balance < MIN_BALANCE:
-        return None
-
-    pat = rec.pattern
-    acc = rec.acc or 50
-    size = size_usdt          # fixed size — same as live trade capital
-    lev = get_lev(acc)
-
-    # Win probability — real factors
-    wp = pat.base_win
-    if a.moon_bull and pat.direction == 1:  wp += 0.04
-    if a.moon_bear and pat.direction == -1: wp += 0.03
-    if a.merc_rx and pat.id != "merc_rx":  wp -= 0.14
-    if a.equinox:                           wp += 0.03
-    if r.range_pos < 0.1 and pat.direction == 1:  wp += 0.04
-    if r.range_pos > 0.9 and pat.direction == -1: wp += 0.04
-    wp = max(0.2, min(0.85, wp))
-
-    win = random.random() < wp
-
-    # P&L with real costs
-    if win:
-        gross = (0.004 + random.random() * 0.035) * lev
-    else:
-        gross = -(0.003 + random.random() * 0.022) * lev
-
-    net_ret = gross - ROUND_TRIP * lev
-    pnl = size * net_ret
-    new_bal = max(0.0, sim.balance + pnl)
-
-    # Update database
-    rec.update(win, net_ret * 100)
-
-    # Update sim
-    sim.balance = new_bal
-    sim.peak = max(sim.peak, new_bal)
-    sim.total += 1
-    if win:
-        sim.wins += 1
-        sim.cons_loss = 0
-        sim.cons_win += 1
-    else:
-        sim.losses += 1
-        sim.cons_loss += 1
-        sim.cons_win = 0
-    sim.curve.append(round(new_bal, 2))
-    if len(sim.curve) > 500:
-        sim.curve = sim.curve[-300:]
-
-    trade = {
-        "pattern": pat.name,
-        "direction": "LONG" if pat.direction == 1 else "SHORT",
-        "win": win,
-        "pnl": round(pnl, 2),
-        "balance": round(new_bal, 2),
-        "acc": acc,
-        "lev": lev,
-        "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-    }
-    sim.trades.insert(0, trade)
-    if len(sim.trades) > 200:
-        sim.trades = sim.trades[:100]
-
-    return trade
 
 
 # ═══════════════════════════════════════════════
@@ -902,7 +760,7 @@ class CoinScanner:
         self.price_history.tick(self.live_price.btc)
         return get_readings(self.price_history.closes, self.live_price, self.onchain)
 
-    def get_signal(self, sim_wins: int, sim_total: int) -> Optional[dict]:
+    def get_signal(self, _w=0, _t=0) -> Optional[dict]:
         """Return best signal dict for this coin, or None."""
         a = get_astro()
         r = get_readings(self.price_history.closes, self.live_price, self.onchain)
@@ -919,7 +777,7 @@ class CoinScanner:
         reward = abs(target - price) / price
         rr     = round(reward / risk, 2) if risk > 0 else 0.0
 
-        edge = calc_edge(self.db, sim_wins, sim_total)
+        edge = calc_edge(list(self.db.records.values()))
         conf = min(95, max(40, round(rec.acc * 0.6 + edge.score * 0.4)))
 
         why = []
@@ -954,6 +812,7 @@ class CoinScanner:
             "why":        why[:4],
             "ingredients":pat.ingredients,
             "merc_rx":    a.merc_rx,
+            "pattern_id": pat.id,
         }
 
 
@@ -974,9 +833,9 @@ class LiveTradeState:
     stop: float = 0.0
     target: float = 0.0
     size_usdt: float = 0.0
-    pattern: str = ""
+    pattern: str = ""         # display name
+    pattern_id: str = ""      # DB key — used to record real outcome
     opened_at: float = 0.0
-    paper: bool = True        # True = simulated, False = real money
 
 
 class BitgetExecutor:
@@ -1110,31 +969,31 @@ class BitgetExecutor:
 class PlatiniumEngine:
     def __init__(self, executor: Optional[BitgetExecutor] = None,
                  trade_size_usdt: float = 1.0,
-                 demo_balance: float = 100.0,
                  symbols: Optional[list] = None):
         # ── multi-coin scanners ──
         self.symbols = symbols or SCAN_SYMBOLS
         self.scanners: dict[str, CoinScanner] = {
             sym: CoinScanner(sym) for sym in self.symbols
         }
-        # ── backward-compat aliases (BTC scanner) ──
+        # ── BTC aliases (backward compat) ──
         btc = self.scanners["BTCUSDT"]
         self.live_price    = btc.live_price
         self.price_history = btc.price_history
-        self.db            = btc.db           # BTC pattern DB (primary)
-        # ── shared state ──
-        self.sim = SimState(start_balance=demo_balance)
+        self.db            = btc.db
+        # ── state ──
         self.tick_count = 0
         self.executor = executor or BitgetExecutor()
         self.live_trade = LiveTradeState()
         self.trade_size_usdt = trade_size_usdt
+        # real trade history (win/loss recorded from actual closes)
+        self.trade_history: list = []
         self._load()
 
     def _save(self):
         try:
             payload = {
-                "sim":  self.sim.to_dict(),
-                "dbs":  {sym: sc.db.to_dict() for sym, sc in self.scanners.items()},
+                "dbs":           {sym: sc.db.to_dict() for sym, sc in self.scanners.items()},
+                "trade_history": self.trade_history[-200:],
             }
             tmp = DATA_FILE + ".tmp"
             with open(tmp, "w") as f:
@@ -1157,7 +1016,8 @@ class PlatiniumEngine:
                         self.scanners[sym].db.load_dict(data)
             elif "db" in payload:
                 self.scanners["BTCUSDT"].db.load_dict(payload["db"])
-            log.info(f"State loaded — balance=${self.sim.balance:.2f} trades={self.sim.total} coins={len(self.scanners)}")
+            self.trade_history = payload.get("trade_history", [])
+            log.info(f"State loaded — {len(self.trade_history)} real trades, {len(self.scanners)} coins")
         except Exception as e:
             log.warning(f"State load failed (starting fresh): {e}")
 
@@ -1166,7 +1026,7 @@ class PlatiniumEngine:
 
     async def open_live_trade(self, session: aiohttp.ClientSession,
                                sig: dict, size_usdt: float = 1.0) -> LiveTradeState:
-        """Open a real or paper trade from a signal dict (any coin)."""
+        """Open a trade on any coin from a signal dict."""
         if self.live_trade.active:
             return self.live_trade
         symbol    = sig.get("symbol", "BTCUSDT")
@@ -1185,25 +1045,33 @@ class PlatiniumEngine:
             target=sig["target"],
             size_usdt=size_usdt,
             pattern=sig["pattern"],
+            pattern_id=sig.get("pattern_id", ""),
             opened_at=time.time(),
-            paper=self.executor.paper,
         )
         return self.live_trade
 
     async def check_and_close_live_trade(self, session: aiohttp.ClientSession) -> Optional[dict]:
         """
-        Check if active trade hit TP/SL. Returns close-event dict or None.
-        For paper trades uses live price; for real trades checks Bitget position.
+        Check if active trade hit TP/SL.
+        Real trades: poll Bitget position — closed when position gone.
+        No keys: use live price vs TP/SL thresholds.
+        Returns close-event dict or None.
         """
         if not self.live_trade.active:
             return None
 
         lt = self.live_trade
-        # Use the scanner for the coin being traded
         scanner = self.scanners.get(lt.symbol, self.scanners["BTCUSDT"])
         price = scanner.live_price.btc
 
-        if lt.paper:
+        if self.executor.enabled:
+            # Real trade — check Bitget
+            pos = await self.executor.get_position(session, lt.symbol)
+            if pos:
+                return None  # still open on exchange
+            win = price > lt.entry if lt.direction == 1 else price < lt.entry
+        else:
+            # No exchange connection — use price vs TP/SL
             hit_tp = (lt.direction == 1 and price >= lt.target) or \
                      (lt.direction == -1 and price <= lt.target)
             hit_sl = (lt.direction == 1 and price <= lt.stop) or \
@@ -1211,51 +1079,33 @@ class PlatiniumEngine:
             if not (hit_tp or hit_sl):
                 return None
             win = hit_tp
-            pnl_pct = ((price - lt.entry) / lt.entry * 100 * lt.direction)
-        else:
-            pos = await self.executor.get_position(session, lt.symbol)
-            if pos:
-                return None  # still open
-            win = price > lt.entry if lt.direction == 1 else price < lt.entry
-            pnl_pct = round((price - lt.entry) / lt.entry * 100 * lt.direction, 2)
 
+        pnl_pct  = round((price - lt.entry) / lt.entry * 100 * lt.direction, 2)
         pnl_usdt = round(lt.size_usdt * pnl_pct / 100, 2)
         duration = round((time.time() - lt.opened_at) / 60, 1)
 
-        # Update demo balance — paper trades affect the sim wallet exactly like real
-        if lt.paper:
-            new_bal = max(0.0, self.sim.balance + pnl_usdt)
-            self.sim.balance = new_bal
-            self.sim.peak    = max(self.sim.peak, new_bal)
-            self.sim.total  += 1
-            self.sim.curve.append(round(new_bal, 2))
-            if len(self.sim.curve) > 500:
-                self.sim.curve = self.sim.curve[-300:]
-            if win:
-                self.sim.wins += 1
-                self.sim.cons_loss = 0
-                self.sim.cons_win += 1
-            else:
-                self.sim.losses += 1
-                self.sim.cons_loss += 1
-                self.sim.cons_win = 0
+        # ── Feed real outcome back to pattern DB ──
+        sc = self.scanners.get(lt.symbol)
+        if sc and lt.pattern_id and lt.pattern_id in sc.db.records:
+            sc.db.records[lt.pattern_id].update(win, pnl_pct)
 
         coin = COIN_NAMES.get(lt.symbol, lt.symbol.replace("USDT", ""))
         event = {
             "symbol":       lt.symbol,
-            "coin":         coin,
-            "pattern":      lt.pattern,
-            "direction":    "LONG" if lt.direction == 1 else "SHORT",
-            "entry":        lt.entry,
-            "exit":         round(price, 6),
-            "pnl_pct":      round(pnl_pct, 2),
-            "pnl_usdt":     pnl_usdt,
-            "win":          win,
-            "duration":     duration,
-            "paper":        lt.paper,
-            "demo_balance": round(self.sim.balance, 2),
+            "coin":      coin,
+            "pattern":   lt.pattern,
+            "direction": "LONG" if lt.direction == 1 else "SHORT",
+            "entry":     lt.entry,
+            "exit":      round(price, 6),
+            "pnl_pct":   round(pnl_pct, 2),
+            "pnl_usdt":  pnl_usdt,
+            "win":       win,
+            "duration":  duration,
         }
-        self.live_trade = LiveTradeState()  # reset
+        self.trade_history.insert(0, event)
+        if len(self.trade_history) > 200:
+            self.trade_history = self.trade_history[:100]
+        self.live_trade = LiveTradeState()
         self._save()
         return event
 
@@ -1307,43 +1157,28 @@ class PlatiniumEngine:
             await sc.update_price(session)
             await asyncio.sleep(0.1)
 
-    def tick(self) -> Optional[dict]:
-        """BTC-only tick (backward compat). Use tick_all() for multi-coin."""
+    def tick_all(self):
+        """
+        Advance price history for every coin. Pure scanning — no fake trades.
+        Pattern learning happens only from real closed trades via check_and_close_live_trade.
+        """
         self.tick_count += 1
-        sc = self.scanners["BTCUSDT"]
-        sc.price_history.tick(sc.live_price.btc)
         a = get_astro()
-        r = get_readings(sc.price_history.closes, sc.live_price, sc.onchain)
-        rec = sc.db.find_best(r, a)
-        trade = None
-        if rec and self.sim.balance > MIN_BALANCE:
-            trade = execute_trade(self.sim, sc.db, rec, r, a, self.trade_size_usdt)
-            self._save()
-        return trade
+        for sc in self.scanners.values():
+            if sc.live_price.fresh:
+                sc.price_history.tick(sc.live_price.btc)
+                # warm up readings so patterns are ready for get_signal()
+                get_readings(sc.price_history.closes, sc.live_price, sc.onchain)
 
-    def tick_all(self) -> list:
-        """
-        Tick every coin scanner. Returns list of sim-trade dicts from all coins
-        that fired this tick. Pattern learning happens for every coin simultaneously.
-        """
-        self.tick_count += 1
-        trades = []
-        a = get_astro()
-        for sym, sc in self.scanners.items():
-            if not sc.live_price.fresh:
-                continue
-            sc.price_history.tick(sc.live_price.btc)
-            r = get_readings(sc.price_history.closes, sc.live_price, sc.onchain)
-            rec = sc.db.find_best(r, a)
-            if rec and self.sim.balance > MIN_BALANCE:
-                trade = execute_trade(self.sim, sc.db, rec, r, a, self.trade_size_usdt)
-                if trade:
-                    trade["symbol"] = sym
-                    trade["coin"]   = COIN_NAMES.get(sym, sym.replace("USDT", ""))
-                    trades.append(trade)
-        if trades:
-            self._save()
-        return trades
+    def tick(self):
+        self.tick_all()
+
+    def get_edge_records(self) -> list:
+        """All pattern records across all coin DBs."""
+        records = []
+        for sc in self.scanners.values():
+            records.extend(sc.db.records.values())
+        return records
 
     def get_signal(self) -> Optional[dict]:
         """Best signal across all coins (highest score wins)."""
@@ -1351,7 +1186,7 @@ class PlatiniumEngine:
         for sc in self.scanners.values():
             if not sc.live_price.fresh:
                 continue
-            sig = sc.get_signal(self.sim.wins, self.sim.total)
+            sig = sc.get_signal(0, 0)
             if sig:
                 all_sigs.append(sig)
         if not all_sigs:
@@ -1359,51 +1194,27 @@ class PlatiniumEngine:
         return max(all_sigs, key=lambda s: s["score"] + s["confidence"] * 0.5)
 
     def get_edge(self) -> EdgeScore:
-        # Aggregate edge across all coin DBs
-        all_records: list = []
-        for sc in self.scanners.values():
-            all_records.extend(sc.db.records.values())
-        pats = [r for r in all_records if r.occ >= 2]
-        if not pats:
-            return calc_edge(self.db, self.sim.wins, self.sim.total)
-        avg = sum(r.acc for r in pats) / len(pats)
-        elite = sum(1 for r in pats if r.acc >= 70)
-        prof  = sum(1 for r in pats if r.ev > 0)
-        obs   = sum(r.occ for r in pats)
-        cons  = round(self.sim.wins / self.sim.total * 100) if self.sim.total > 0 else 0
-        score = min(100, round(
-            avg * 0.35 + (elite / max(len(pats), 1)) * 30 +
-            (prof / max(len(pats), 1)) * 20 + min(obs / 300, 1) * 15
-        ))
-        status = ("ELITE" if score >= 85 else "SHARP" if score >= 70 else
-                  "EDGE" if score >= 50 else "FORMING" if score >= 30 else "BLURRY")
-        return EdgeScore(score, status, len(pats), obs, elite, cons)
+        return calc_edge(self.get_edge_records())
 
     def get_astro(self) -> AstroState:
         return get_astro()
 
     def get_summary(self) -> dict:
-        edge = self.get_edge()
-        pnl_usdt = round(self.sim.balance - self.sim.start_balance, 2)
+        edge  = self.get_edge()
+        wins  = sum(1 for t in self.trade_history if t.get("win"))
+        total = len(self.trade_history)
         return {
-            "balance":       round(self.sim.balance, 2),
-            "start_balance": round(self.sim.start_balance, 2),
-            "pnl_usdt":      pnl_usdt,
-            "peak":          round(self.sim.peak, 2),
-            "pnl_pct":       self.sim.pnl_pct,
-            "drawdown":      self.sim.drawdown,
-            "wr":            self.sim.wr,
-            "total":         self.sim.total,
-            "wins":          self.sim.wins,
-            "losses":        self.sim.losses,
-            "cons_loss":     self.sim.cons_loss,
-            "cons_win":      self.sim.cons_win,
-            "edge_score":    edge.score,
-            "edge_status":   edge.status,
-            "db_size":       edge.db_size,
-            "elite":         edge.elite,
-            "btc":           round(self.live_price.btc, 2),
-            "btc_chg":       round(self.live_price.chg, 2),
-            "astro":         self.get_astro(),
-            "last_trades":   self.sim.trades[:5],
+            "total":       total,
+            "wins":        wins,
+            "losses":      total - wins,
+            "wr":          round(wins / total * 100, 1) if total else 0.0,
+            "edge_score":  edge.score,
+            "edge_status": edge.status,
+            "db_size":     edge.db_size,
+            "elite":       edge.elite,
+            "total_obs":   edge.total_obs,
+            "btc":         round(self.live_price.btc, 2),
+            "btc_chg":     round(self.live_price.chg, 2),
+            "astro":       self.get_astro(),
+            "last_trades": self.trade_history[:5],
         }
