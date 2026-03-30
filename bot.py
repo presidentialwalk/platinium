@@ -22,7 +22,7 @@ from telegram.constants import ParseMode
 from engine import (
     PlatiniumEngine, fetch_price, fetch_klines, get_astro,
     get_readings, PATTERNS, calc_edge, LivePrice,
-    BitgetExecutor, LiveTradeState
+    BlofinExecutor, LiveTradeState
 )
 from mas import MASBrain
 from dashboard import Dashboard
@@ -32,10 +32,10 @@ TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TOKEN_HERE")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-# Bitget execution
-BITGET_API_KEY    = os.getenv("BITGET_API_KEY", "")
-BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
-BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
+# Blofin execution
+BLOFIN_API_KEY    = os.getenv("BLOFIN_API_KEY", "")
+BLOFIN_API_SECRET = os.getenv("BLOFIN_API_SECRET", "")
+BLOFIN_PASSPHRASE = os.getenv("BLOFIN_PASSPHRASE", "")
 TRADE_CAPITAL_USDT = float(os.getenv("TRADE_CAPITAL_USDT", "1"))   # editable via /settrade
 
 # Alert thresholds
@@ -58,10 +58,10 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── GLOBALS ──────────────────────────────────────────────────────
-_executor = BitgetExecutor(
-    api_key=BITGET_API_KEY,
-    secret=BITGET_API_SECRET,
-    passphrase=BITGET_PASSPHRASE,
+_executor = BlofinExecutor(
+    api_key=BLOFIN_API_KEY,
+    secret=BLOFIN_API_SECRET,
+    passphrase=BLOFIN_PASSPHRASE,
 )
 engine = PlatiniumEngine(
     executor=_executor,
@@ -80,7 +80,7 @@ engine_paused: bool = False
 _keys_str = "keys OK" if _executor.enabled else "NO KEYS — signals only"
 log.info(f"╔══════════════════════════════════════╗")
 log.info(f"║  PLATINIUM  │  LIVE — REAL MONEY     ║")
-log.info(f"║  Bitget: {_keys_str:<29}║")
+log.info(f"║  Blofin: {_keys_str:<29}║")
 log.info(f"║  ${TRADE_CAPITAL_USDT} per trade │  20 coins scanning   ║")
 log.info(f"╚══════════════════════════════════════╝")
 
@@ -465,7 +465,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lt = engine.get_live_trade()
     trade_line  = f"⚡ Trade: *{'OPEN — ' + escape(lt.symbol.replace('USDT','')) + ' ' + escape(lt.pattern) if lt.active else 'none'}*"
     mode_line   = f"💸 Mode: *LIVE — REAL MONEY*"
-    bitget_line = f"🔑 Bitget: *{'✅ connected' if _executor.enabled else '⚠️ keys not set'}*"
+    bitget_line = f"🔑 Blofin: *{'✅ connected' if _executor.enabled else '⚠️ keys not set'}*"
     txt = "\n".join([
         "✅ *PLATINIUM Status*",
         "",
@@ -558,7 +558,7 @@ async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📭 *No open trade right now*\n\n"
             f"Mode: *LIVE*\n"
-            f"Bitget: *{escape(bitget_ok)}*\n"
+            f"Blofin: *{escape(bitget_ok)}*\n"
             f"Capital per trade: *{escape(fmt_num(TRADE_CAPITAL_USDT))}*",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=main_keyboard())
@@ -614,7 +614,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await edit(
                 f"📭 *No open trade*\n\n"
                 f"Mode: *LIVE*\n"
-                f"Bitget: *{escape(bitget)}*\n"
+                f"Blofin: *{escape(bitget)}*\n"
                 f"Size per trade: *{escape(fmt_num(TRADE_CAPITAL_USDT))}*"
             )
 
@@ -654,7 +654,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "",
             f"⚡ Trade: *{('OPEN — ' + escape(lt.pattern)) if lt.active else 'none'}*",
             f"💸 Mode: *LIVE*",
-            f"🔑 Bitget: *{'✅' if _executor.enabled else '⚠️ keys not set'}*",
+            f"🔑 Blofin: *{'✅' if _executor.enabled else '⚠️ keys not set'}*",
         ]))
 
     elif data == "conditions":
@@ -923,7 +923,7 @@ async def post_init(app: Application):
     # Send startup message to configured chat
     if CHAT_ID:
         try:
-            keys_label = escape("✅ Bitget connected" if _executor.enabled else "⚠️ No keys — signals only")
+            keys_label = escape("✅ Blofin connected" if _executor.enabled else "⚠️ No keys — signals only")
             size_label = escape(f"${TRADE_CAPITAL_USDT} per trade")
             await app.bot.send_message(
                 chat_id=int(CHAT_ID),

@@ -13,6 +13,7 @@ import aiohttp
 import hmac
 import hashlib
 import base64
+import uuid
 import os
 import logging
 from datetime import datetime, timezone
@@ -817,10 +818,17 @@ class CoinScanner:
 
 
 # ═══════════════════════════════════════════════
-# BITGET EXECUTION LAYER
+# BLOFIN EXECUTION LAYER
 # ═══════════════════════════════════════════════
 
-BITGET_BASE = "https://api.bitget.com"
+BLOFIN_BASE = "https://openapi.blofin.com"
+
+
+def _inst(symbol: str) -> str:
+    """Convert exchange symbol → Blofin instId.  BTCUSDT → BTC-USDT"""
+    if symbol.endswith("USDT"):
+        return symbol[:-4] + "-USDT"
+    return symbol
 
 
 @dataclass
@@ -838,80 +846,88 @@ class LiveTradeState:
     opened_at: float = 0.0
 
 
-class BitgetExecutor:
-    def __init__(self, api_key: str = "", secret: str = "", passphrase: str = "",
-                 paper: bool = True):
-        self.api_key = api_key
-        self.secret = secret
+class BlofinExecutor:
+    def __init__(self, api_key: str = "", secret: str = "", passphrase: str = ""):
+        self.api_key   = api_key
+        self.secret    = secret
         self.passphrase = passphrase
-        self.paper = paper
-        self.enabled = bool(api_key and secret and passphrase)
+        self.enabled   = bool(api_key and secret and passphrase)
 
-    def _sign(self, timestamp: str, method: str, path: str, body: str = "") -> str:
-        msg = f"{timestamp}{method.upper()}{path}{body}"
-        sig = hmac.new(self.secret.encode(), msg.encode(), hashlib.sha256).digest()
-        return base64.b64encode(sig).decode()
+    def _sign(self, path: str, method: str, timestamp: str, nonce: str, body: str = "") -> str:
+        # Blofin signature: path + METHOD + timestamp + nonce + body → HMAC-SHA256 → hex → base64
+        prehash = path + method.upper() + timestamp + nonce + body
+        hex_sig = hmac.new(self.secret.encode(), prehash.encode(), hashlib.sha256).hexdigest()
+        return base64.b64encode(hex_sig.encode()).decode()
 
     def _headers(self, method: str, path: str, body: str = "") -> dict:
-        ts = str(int(time.time() * 1000))
+        ts    = str(int(time.time() * 1000))
+        nonce = str(uuid.uuid4())
         return {
             "ACCESS-KEY":        self.api_key,
-            "ACCESS-SIGN":       self._sign(ts, method, path, body),
+            "ACCESS-SIGN":       self._sign(path, method, ts, nonce, body),
             "ACCESS-TIMESTAMP":  ts,
+            "ACCESS-NONCE":      nonce,
             "ACCESS-PASSPHRASE": self.passphrase,
             "Content-Type":      "application/json",
-            "locale":            "en-US",
         }
 
     async def get_balance(self, session: aiohttp.ClientSession) -> float:
-        """Return available USDT balance on Bitget futures."""
+        """Return available USDT balance in Blofin futures account."""
         if not self.enabled:
             return 0.0
-        path = "/api/v2/mix/account/account?symbol=BTCUSDT&productType=USDT-FUTURES&marginCoin=USDT"
+        path = "/api/v1/asset/balances?accountType=futures&currency=USDT"
         try:
             async with session.get(
-                BITGET_BASE + path,
+                BLOFIN_BASE + path,
                 headers=self._headers("GET", path),
-                timeout=aiohttp.ClientTimeout(total=8)
+                timeout=aiohttp.ClientTimeout(total=8),
             ) as r:
                 data = await r.json()
-            return float(data.get("data", {}).get("available", 0))
+            items = data.get("data", [])
+            if items:
+                return float(items[0].get("available", 0))
         except Exception:
-            return 0.0
+            pass
+        return 0.0
 
     async def place_order(self, session: aiohttp.ClientSession,
                           symbol: str, direction: int, size_usdt: float,
                           price: float, stop: float, target: float) -> dict:
-        """Open a market order with attached TP/SL on any USDT-M perp."""
-        if self.paper or not self.enabled:
+        """Open a market order with attached TP/SL on any USDT perp."""
+        if not self.enabled:
             return {"paper": True, "orderId": f"PAPER-{int(time.time())}"}
 
-        side      = "buy"  if direction == 1 else "sell"
-        hold_side = "long" if direction == 1 else "short"
+        inst_id  = _inst(symbol)
+        pos_side = "long" if direction == 1 else "short"
+        side     = "buy"  if direction == 1 else "sell"
         size_coin = round(size_usdt / price, 6)
 
         body = json.dumps({
-            "symbol":                symbol,
-            "productType":           "USDT-FUTURES",
-            "marginMode":            "isolated",
-            "marginCoin":            "USDT",
-            "size":                  str(size_coin),
-            "side":                  side,
-            "tradeSide":             "open",
-            "orderType":             "market",
-            "presetStopLossPrice":   str(round(stop, 4)),
-            "presetTakeProfitPrice": str(round(target, 4)),
+            "instId":       inst_id,
+            "marginMode":   "isolated",
+            "positionSide": pos_side,
+            "side":         side,
+            "orderType":    "market",
+            "size":         str(size_coin),
+            "attachAlgoOrders": [{
+                "tpTriggerPrice":     str(round(target, 4)),
+                "tpOrderPrice":       "-1",
+                "tpTriggerPriceType": "last",
+                "slTriggerPrice":     str(round(stop, 4)),
+                "slOrderPrice":       "-1",
+                "slTriggerPriceType": "last",
+            }],
         })
-        path = "/api/v2/mix/order/placeOrder"
+        path = "/api/v1/trade/order-algo"
         try:
             async with session.post(
-                BITGET_BASE + path,
+                BLOFIN_BASE + path,
                 headers=self._headers("POST", path, body),
                 data=body,
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
                 data = await r.json()
-            order_id = data.get("data", {}).get("orderId", "")
+            order_id = data.get("data", {}).get("tpslId", "")
             return {"paper": False, "orderId": order_id, "raw": data}
         except Exception as e:
             return {"paper": False, "orderId": "", "error": str(e)}
@@ -919,22 +935,23 @@ class BitgetExecutor:
     async def close_position(self, session: aiohttp.ClientSession,
                              symbol: str, direction: int) -> dict:
         """Close the open position on the given symbol at market."""
-        if self.paper or not self.enabled:
+        if not self.enabled:
             return {"paper": True}
 
-        hold_side = "long" if direction == 1 else "short"
+        inst_id  = _inst(symbol)
+        pos_side = "long" if direction == 1 else "short"
         body = json.dumps({
-            "symbol":      symbol,
-            "productType": "USDT-FUTURES",
-            "holdSide":    hold_side,
+            "instId":       inst_id,
+            "marginMode":   "isolated",
+            "positionSide": pos_side,
         })
-        path = "/api/v2/mix/order/closePositions"
+        path = "/api/v1/trade/close-position"
         try:
             async with session.post(
-                BITGET_BASE + path,
+                BLOFIN_BASE + path,
                 headers=self._headers("POST", path, body),
                 data=body,
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
                 return await r.json()
         except Exception as e:
@@ -945,21 +962,21 @@ class BitgetExecutor:
         """Return current open position for a symbol (empty dict if none)."""
         if not self.enabled:
             return {}
-        path = (f"/api/v2/mix/position/singlePosition"
-                f"?symbol={symbol}&productType=USDT-FUTURES&marginCoin=USDT")
+        inst_id = _inst(symbol)
+        path = f"/api/v1/trade/positions?instId={inst_id}"
         try:
             async with session.get(
-                BITGET_BASE + path,
+                BLOFIN_BASE + path,
                 headers=self._headers("GET", path),
-                timeout=aiohttp.ClientTimeout(total=8)
+                timeout=aiohttp.ClientTimeout(total=8),
             ) as r:
                 data = await r.json()
-            positions = data.get("data", [])
-            if positions and float(positions[0].get("total", 0)) > 0:
-                return positions[0]
-            return {}
+            for pos in data.get("data", []):
+                if float(pos.get("baseCurrencyAmount", 0)) > 0:
+                    return pos
         except Exception:
-            return {}
+            pass
+        return {}
 
 
 # ═══════════════════════════════════════════════
@@ -967,7 +984,7 @@ class BitgetExecutor:
 # ═══════════════════════════════════════════════
 
 class PlatiniumEngine:
-    def __init__(self, executor: Optional[BitgetExecutor] = None,
+    def __init__(self, executor: Optional[BlofinExecutor] = None,
                  trade_size_usdt: float = 1.0,
                  symbols: Optional[list] = None):
         # ── multi-coin scanners ──
@@ -982,7 +999,7 @@ class PlatiniumEngine:
         self.db            = btc.db
         # ── state ──
         self.tick_count = 0
-        self.executor = executor or BitgetExecutor()
+        self.executor = executor or BlofinExecutor()
         self.live_trade = LiveTradeState()
         self.trade_size_usdt = trade_size_usdt
         # real trade history (win/loss recorded from actual closes)
